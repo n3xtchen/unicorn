@@ -195,8 +195,10 @@ const WRITE_PAYLOAD = String.raw`
   const iBegin = tail.findIndex(function (l) { return idxBeginRe.test(l); });
   const iEnd = tail.findIndex(function (l) { return idxEndRe.test(l); });
 
+  // 分类列写成**裸标签**（不裹反引号），这样 Obsidian 才会把它当标签。
+  // 原文锚点仍是不可读的 opaque id，继续裹反引号。
   const linkCell = P.links && P.links.length > 0 ? P.links : "\u2014";
-  const row = "| " + P.time + " | " + BT + P.id + BT + " | " + BT + P.category + BT + " | " + linkCell + " |";
+  const row = "| " + P.time + " | " + BT + P.id + BT + " | " + P.category + " | " + linkCell + " |";
 
   if (derived >= 0 && iBegin >= 0 && iEnd > iBegin) {
     tail = tail.slice(0, iEnd).concat([row], tail.slice(iEnd));
@@ -265,23 +267,6 @@ const WRITE_PAYLOAD = String.raw`
 })()
 `;
 
-const CLASSIFY_PAYLOAD = String.raw`
-(async () => {
-  const P = globalThis.__DJ_P;
-  const out = [];
-  const files = app.vault.getMarkdownFiles();
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    let ok = false;
-    for (let r = 0; r < P.roots.length; r++) {
-      if (f.path.indexOf(P.roots[r]) === 0) { ok = true; break; }
-    }
-    if (ok) out.push({ path: f.path, base: f.basename });
-  }
-  return JSON.stringify({ ok: true, count: out.length, files: out });
-})()
-`;
-
 const FILES_PAYLOAD = String.raw`
 (async () => {
   const P = globalThis.__DJ_P;
@@ -305,6 +290,49 @@ const FILES_PAYLOAD = String.raw`
     }
   }
   return JSON.stringify({ ok: true, all: all, paths: paths, aliases: aliases });
+})()
+`;
+
+// 标签词表按 Obsidian 的实时索引生成，**不落配置文件**（配置会过期）。
+// 只扫限定目录，避免把 Evernote / 999-待整理 这类「待整合区」的标签混进来。
+// 返回 { ok, roots, counted, tags: { "#t": { count, samples } } }
+const TAGS_PAYLOAD = String.raw`
+(async () => {
+  const P = globalThis.__DJ_P;
+  const roots = P.roots;
+  const out = Object.create(null);
+  const files = app.vault.getMarkdownFiles();
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    let ok = false;
+    for (let r = 0; r < roots.length; r++) {
+      if (f.path.indexOf(roots[r]) === 0) { ok = true; break; }
+    }
+    if (!ok) continue;
+    let c = null;
+    try { c = app.metadataCache.getFileCache(f); } catch (e) { c = null; }
+    if (!c) continue;
+    const seen = Object.create(null);
+    if (c.tags) {
+      for (let k = 0; k < c.tags.length; k++) seen[c.tags[k].tag] = 1;
+    }
+    const fm = c.frontmatter ? c.frontmatter.tags : null;
+    if (fm) {
+      const list = Array.isArray(fm) ? fm : String(fm).split(",");
+      for (let k = 0; k < list.length; k++) {
+        let t = String(list[k]).trim();
+        if (t === "") continue;
+        if (t.charAt(0) !== "#") t = "#" + t;
+        seen[t] = 1;
+      }
+    }
+    for (const t in seen) {
+      if (!out[t]) out[t] = { count: 0, samples: [] };
+      out[t].count = out[t].count + 1;
+      if (out[t].samples.length < 2) out[t].samples.push(f.path);
+    }
+  }
+  return JSON.stringify({ ok: true, roots: roots, counted: Object.keys(out).length, tags: out });
 })()
 `;
 
@@ -371,126 +399,6 @@ function matchTier(text, token) {
   }
 }
 
-const TIER_NAME = { 3: "exact", 2: "prefix", 1: "contains" };
-
-function depthOf(p) {
-  return p.split("/").length;
-}
-
-// §四 并列打破：(a) 09-Note4LLM/ 优先 (b) 路径层数少 (c) 字典序小
-function tieBreak(cands) {
-  let pool = cands.slice();
-  const preferred = pool.filter((c) => c.path.startsWith("09-Note4LLM/"));
-  if (preferred.length > 0 && preferred.length < pool.length) pool = preferred;
-  if (pool.length > 1) {
-    const minDepth = Math.min(...pool.map((c) => depthOf(c.path)));
-    pool = pool.filter((c) => depthOf(c.path) === minDepth);
-  }
-  if (pool.length > 1) {
-    pool = pool.slice().sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  }
-  return { winner: pool[0], pool };
-}
-
-function resolveDomain(p, registry) {
-  let best = null;
-  let bestLen = -1;
-  for (const [d, prefixes] of Object.entries(registry.domainPaths)) {
-    for (const pre of prefixes) {
-      if (p.startsWith(pre) && pre.length > bestLen) {
-        best = d;
-        bestLen = pre.length;
-      }
-    }
-  }
-  if (best) return best;
-  for (const [d, pre] of Object.entries(registry.catchAll || {})) {
-    if (p.startsWith(pre)) return d;
-  }
-  return null;
-}
-
-function classify(text, registry, files) {
-  // 第 1 步：注册表关键词
-  const regHits = [];
-  for (const a of registry.anchors) {
-    let tier = 0;
-    let keyword = null;
-    for (const kw of a.keywords) {
-      const t = matchTier(text, kw);
-      if (t > tier) {
-        tier = t;
-        keyword = kw;
-      }
-    }
-    if (tier > 0) regHits.push({ anchor: a.anchor, path: a.path, domain: a.domain, tier, keyword, source: "registry" });
-  }
-
-  if (regHits.length > 0) {
-    const maxTier = Math.max(...regHits.map((c) => c.tier));
-    const top = regHits.filter((c) => c.tier === maxTier);
-    const { winner } = tieBreak(top);
-    return {
-      ok: true,
-      source: "registry",
-      category: winner.domain + "/" + winner.anchor,
-      domain: winner.domain,
-      anchor: winner.anchor,
-      path: winner.path,
-      tier: TIER_NAME[maxTier],
-      matchedKeyword: winner.keyword,
-      ambiguous: top.length > 1,
-      candidates: top.map((c) => ({
-        anchor: c.anchor, path: c.path, domain: c.domain,
-        tier: TIER_NAME[c.tier], keyword: c.keyword,
-      })),
-      needsUser: top.length > 1,
-    };
-  }
-
-  // 第 2 步：白名单内的唯一 basename 解析
-  const baseHits = [];
-  for (const f of files) {
-    const tier = matchTier(text, f.base);
-    if (tier > 0) baseHits.push({ anchor: f.base, path: f.path, tier });
-  }
-  if (baseHits.length > 0) {
-    const maxTier = Math.max(...baseHits.map((c) => c.tier));
-    const top = baseHits.filter((c) => c.tier === maxTier);
-    const enriched = top.map((c) => ({
-      anchor: c.anchor, path: c.path, domain: resolveDomain(c.path, registry) || "learn",
-      tier: TIER_NAME[c.tier],
-    }));
-    const { winner } = tieBreak(enriched);
-    return {
-      ok: true,
-      source: "basename",
-      category: winner.domain + "/" + winner.anchor,
-      domain: winner.domain,
-      anchor: winner.anchor,
-      path: winner.path,
-      tier: winner.tier,
-      ambiguous: enriched.length > 1,
-      candidates: enriched,
-      needsUser: enriched.length > 1,
-    };
-  }
-
-  // 第 3/4 步：无法判定 → unsorted/- 占位 + 当场确认（D5）
-  return {
-    ok: true,
-    source: "none",
-    category: "unsorted/-",
-    domain: "unsorted",
-    anchor: "-",
-    tier: null,
-    ambiguous: false,
-    candidates: [],
-    leavesByDomain: registry.leaves || {},
-    needsUser: true,
-    note: "无法从注册表或现有笔记解析出锚点。不得猜测：请向用户确认域与锚点后再回填分类列。",
-  };
-}
 
 // ---------------------------------------------------------------------------
 // 校对
@@ -974,35 +882,194 @@ function listFiles(vault) {
   return evalInObsidian(vault, code);
 }
 
-// D5 要求「不静默降级」，所以分类的合法性必须在写盘前机械校验。
-// 五项写盘校验只保证**原文**不被破坏，管不到派生层的分类列：一个拼错的域
-// 会安安静静写进索引表，而且 allOk 还是 true。
-function validateCategory(category, registry, vault) {
-  const raw = String(category);
-  const parts = raw.split("/");
-  if (parts.length !== 2) return { ok: false, reason: "必须是 <域>/<锚点> 两段，收到 " + JSON.stringify(raw) };
-  const domain = parts[0].trim();
-  const anchor = parts[1].trim();
-  if (registry.domains.indexOf(domain) < 0) {
-    return { ok: false, reason: "域「" + domain + "」不在闭集内：" + registry.domains.join(" / ") };
+// 分类现在是**标签**：没有「域/锚点」，也不再要求锚点必须是库里真实存在的笔记。
+// 词表实时来自 Obsidian（TAGS_PAYLOAD），不落配置文件，所以不会过期。
+const DEFAULT_TAG_ROOTS = [
+  "00-InBox&FleetNote",
+  "02-Done",
+  "09-Note4LLM",
+  "10-GTD",
+  "11-Knowledge",
+];
+// 占位就是骨架里的一级标签 unsorted，不另造词
+const PLACEHOLDER_TAG = "#unsorted";
+
+// 剔除规则是机械的，不是需要维护的配置：
+//   - #gtd/* 是任务状态（next-action / wait-for / calendar…），不是主题分类
+//   - 纯数字标签来自 GitHub 链接标题（"Issue #2672"），Obsidian 会把它们当标签
+function tagDropped(tag) {
+  const body = tag.slice(1);
+  if (body === "gtd" || body.indexOf("gtd/") === 0) return "gtd";
+  if (/^\d+$/.test(body)) return "numeric";
+  // 单字符标签几乎必是代码或链接噪声（例：#n 来自 Jupyter 笔记里的 JSON）
+  if (body.length <= 1) return "short";
+  return null;
+}
+
+function tagRoots(args) {
+  if (args && typeof args.scope === "string" && args.scope.trim() !== "") {
+    return args.scope.split(",").map((s) => s.trim()).filter(Boolean);
   }
-  if (anchor === "") return { ok: false, reason: "锚点为空。" };
-  if (domain === "unsorted") {
-    return anchor === "-" ? { ok: true } : { ok: false, reason: "unsorted 的锚点只能是 -。" };
+  return DEFAULT_TAG_ROOTS;
+}
+
+// 词表 = 「文档里维护的一二级骨架」 ∪ 「限定目录内实有的库标签」。
+// 前者稳定、可审阅（来自 05-分类词表.md 的机械派生），后者实时、不用维护。
+function loadTags(vault, args) {
+  const roots = tagRoots(args);
+  const registry = loadRegistry(vault, args);
+  const sk = registry.tagSkeleton || { level1: [], level2: {}, all: [], paths: {} };
+
+  const code = "globalThis.__DJ_P = " + JSON.stringify({ roots: roots }) + ";\n" + TAGS_PAYLOAD;
+  const res = evalInObsidian(vault, code);
+
+  const dropped = { gtd: 0, numeric: 0, short: 0 };
+  const liveMap = new Map();
+  for (const t in res.tags) {
+    const why = tagDropped(t);
+    if (why) {
+      dropped[why] = (dropped[why] || 0) + 1;
+      continue;
+    }
+    liveMap.set(t, { count: res.tags[t].count, samples: res.tags[t].samples });
   }
-  if (anchor === "-") return { ok: false, reason: "只有 unsorted 才允许锚点为 -。" };
+
+  // 锚点关键词也跟着骨架走：这样「销量」能命中 #work/sales，恢复到旧 classify 的能力
+  const kwMap = new Map();
+  for (const a of registry.anchors || []) {
+    kwMap.set("#" + a.domain + "/" + a.anchor, Array.isArray(a.keywords) ? a.keywords : []);
+  }
+
+  const tags = [];
   const known = new Set();
-  for (const a of registry.anchors) known.add(a.anchor);
-  for (const l of registry.leaves[domain] || []) known.add(l);
-  if (known.has(anchor)) return { ok: true };
-  // 动态 basename 锚点是分类流程允许的唯一非注册表来源，必须真的存在于库中。
-  const names = new Set(listFiles(vault).all.map((b) => String(b).toLowerCase()));
-  if (names.has(anchor.toLowerCase())) return { ok: true };
+  for (const t of sk.all) {
+    const lv = liveMap.get(t);
+    tags.push({
+      tag: t,
+      source: "skeleton",
+      level: t.indexOf("/") < 0 ? 1 : 2,
+      count: lv ? lv.count : 0,
+      samples: lv ? lv.samples : [],
+      notePath: (sk.paths && sk.paths[t]) || "",
+      keywords: kwMap.get(t) || [],
+    });
+    known.add(t);
+  }
+  const extra = [];
+  for (const [t, v] of liveMap) {
+    if (known.has(t)) continue;
+    extra.push({
+      tag: t,
+      source: "vault",
+      level: t.split("/").length,
+      count: v.count,
+      samples: v.samples,
+      notePath: "",
+      keywords: [],
+    });
+  }
+  extra.sort((a, b) => b.count - a.count || (a.tag < b.tag ? -1 : 1));
+
   return {
-    ok: false,
-    reason:
-      "锚点「" + anchor + "」既不是注册表条目，也不是 " + domain + " 的域叶子，也不是库中已有笔记名。",
+    ok: true,
+    roots: roots,
+    level1Count: sk.level1.length,
+    level2Count: sk.all.length - sk.level1.length,
+    skeletonCount: sk.all.length,
+    liveCount: liveMap.size,
+    dropped: dropped,
+    count: tags.length + extra.length,
+    tags: tags.concat(extra),
   };
+}
+
+// 只按词表做机械匹配，命中的是标签名还是锚点关键词会分开报告。
+// 候选**只是候选**：最终要用户点头（D5）。
+function suggestTags(content, tagList) {
+  const out = [];
+  for (const t of tagList) {
+    const body = t.tag.slice(1);
+    const segs = body.split("/");
+    const leaf = segs[segs.length - 1];
+    let matched = "";
+    let kind = "";
+    if (matchTier(content, body) > 0) {
+      matched = body;
+      kind = "tag";
+    } else if (leaf !== body && matchTier(content, leaf) > 0) {
+      matched = leaf;
+      kind = "tag";
+    } else {
+      for (const kw of t.keywords || []) {
+        if (matchTier(content, kw) > 0) {
+          matched = kw;
+          kind = "keyword";
+          break;
+        }
+      }
+    }
+    if (matched !== "") {
+      out.push({
+        tag: t.tag,
+        source: t.source,
+        kind: kind,
+        matched: matched,
+        count: t.count,
+        notePath: t.notePath || "",
+        samples: t.samples || [],
+      });
+    }
+  }
+  out.sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === "tag" ? -1 : 1;
+    const sa = a.source === "skeleton" ? 0 : 1;
+    const sb = b.source === "skeleton" ? 0 : 1;
+    if (sa !== sb) return sa - sb;
+    return b.count - a.count || (a.tag < b.tag ? -1 : 1);
+  });
+  return out;
+}
+
+// 标签格式校验。合法即可写，**不要求标签已存在**——这正是标签相对文件锚点的好处。
+// D5 要求「不静默降级」，所以这一关必须在写盘前过；五项写盘校验只管**原文**，
+// 管不到派生层的分类列。
+const TAG_INVALID_CHARS = /[\s#,.;:!?()[\]{}|"']/;
+function validateTags(category, known) {
+  const raw = String(category).trim();
+  if (raw === "") return { ok: false, reason: "分类为空。" };
+  const toks = raw.split(/\s+/);
+  const novel = [];
+  for (const t of toks) {
+    if (t.charAt(0) !== "#") {
+      return { ok: false, reason: "分类必须是标签，每个都以 # 开头，收到 " + JSON.stringify(t) };
+    }
+    const body = t.slice(1);
+    if (body === "") return { ok: false, reason: "空标签 #。" };
+    if (TAG_INVALID_CHARS.test(body)) {
+      return { ok: false, reason: "标签含非法字符（空白或标点）：" + JSON.stringify(t) };
+    }
+    if (body.charAt(0) === "/" || body.charAt(body.length - 1) === "/" || body.indexOf("//") >= 0) {
+      return { ok: false, reason: "层级分隔符 / 的位置不对：" + JSON.stringify(t) };
+    }
+    const why = tagDropped(t);
+    if (why === "numeric") {
+      return { ok: false, reason: "纯数字标签（多来自 GitHub 链接的 Issue #123）不能当分类：" + JSON.stringify(t) };
+    }
+    if (why === "gtd") {
+      return { ok: false, reason: "#gtd/* 是任务状态，不是主题分类：" + JSON.stringify(t) };
+    }
+    if (why === "short") {
+      return { ok: false, reason: "单字符标签不能当分类：" + JSON.stringify(t) };
+    }
+    // 骨架与库内实有之外的标签 = 新建。**允许**，但必须走 --allow-new-tag，
+    // 也就是必须先问过用户（D5）。
+    if (known) {
+      const inSkeleton = known.skeleton.has(t);
+      const inLive = known.live.has(t);
+      if (!inSkeleton && !inLive) novel.push(t);
+    }
+  }
+  return { ok: true, tags: toks, novel: novel };
 }
 
 function runProofread(vault, content, skipKinds) {
@@ -1022,6 +1089,547 @@ function readContent(args) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// 改写**已写入**的原文（R3 的显式例外）
+//
+// R3「原文逐字不改」的作用是禁止 agent 擅自改写用户的话。事后改错字不是放宽
+// R3，而是同一件事的另一面：用户自己事后发现了错字要求修。所以本模式沿用
+// 写入路径上的那三条约束，一字不变：
+//   1. 只能由脚本机械执行，模型不产出最终文本；
+//   2. 必须给定「错→对」对，且命中数被验证；
+//   3. 只动 jc:begin/jc:end 之间，块外一个字节都不改。
+// 另外：改完正文后它的 sha1 与块 id 就不再一致，所以 id 必须跟着重算，
+// 否则「同内容 → 同 id」这个幂等前提就断了（索引行里的 id 一起改）。
+// ---------------------------------------------------------------------------
+
+const SEARCHID_PAYLOAD = String.raw`
+(async () => {
+  const P = globalThis.__DJ_P;
+  const found = [];
+  for (const f of app.vault.getMarkdownFiles()) {
+    const c = await app.vault.cachedRead(f);
+    for (const id of P.ids) {
+      if (c.indexOf("<!-- jc:begin id=" + id + " -->") >= 0) {
+        found.push({ id: id, path: f.path });
+      }
+    }
+  }
+  return JSON.stringify({ ok: true, found: found, root: app.vault.adapter.basePath });
+})()
+`;
+
+const READFILE_PAYLOAD = String.raw`
+(async () => {
+  const P = globalThis.__DJ_P;
+  const f = app.vault.getAbstractFileByPath(P.path);
+  if (!f) return JSON.stringify({ ok: false, error: "file-missing", path: P.path });
+  return JSON.stringify({ ok: true, path: P.path, content: await app.vault.read(f) });
+})()
+`;
+
+// 写入前先确认文件仍是读到的那个字节序列（乐观并发）：
+// 若期间 Obsidian 那边改过，就原样返回、不落盘，由上层报 readback-mismatch。
+const FIXWRITTEN_PAYLOAD = String.raw`
+(async () => {
+  const P = globalThis.__DJ_P;
+  const f = app.vault.getAbstractFileByPath(P.path);
+  if (!f) return JSON.stringify({ ok: false, error: "file-missing", path: P.path });
+  let seen = "";
+  await app.vault.process(f, (data) => {
+    seen = data;
+    if (data !== P.expectBefore) return data;
+    return P.after;
+  });
+  const after = await app.vault.read(f);
+  return JSON.stringify({
+    ok: true,
+    path: P.path,
+    beforeMatched: seen === P.expectBefore,
+    written: seen === P.expectBefore,
+    readBackExact: after === P.after
+  });
+})()
+`;
+
+function parseReplaceList(spec) {
+  if (typeof spec !== "string" || spec.trim() === "") {
+    throw new Error("--replace 为空（写法：--replace='便宜→偏移'）");
+  }
+  const out = [];
+  for (const part of spec.split(",")) {
+    const s = part.trim();
+    if (s === "") continue;
+    const i = s.indexOf("→");
+    if (i < 0) throw new Error("--replace 缺少箭头 →：" + JSON.stringify(s));
+    const from = s.slice(0, i);
+    const to = s.slice(i + 1);
+    if (from === "") throw new Error("--replace 左侧为空：" + JSON.stringify(s));
+    if (to === "") throw new Error("--replace 右侧为空：" + JSON.stringify(s));
+    if (from === to) throw new Error("--replace 两侧相同：" + JSON.stringify(s));
+    out.push({ from: from, to: to });
+  }
+  if (out.length === 0) throw new Error("--replace 为空");
+  return out;
+}
+
+function countOf(hay, needle) {
+  let n = 0;
+  let i = hay.indexOf(needle);
+  while (i >= 0) {
+    n += 1;
+    i = hay.indexOf(needle, i + needle.length);
+  }
+  return n;
+}
+
+function replaceAllText(hay, from, to) {
+  return hay.split(from).join(to);
+}
+
+// 块体 = begin 标记之后 "\n\n" 与 end 标记之前 "\n\n" 之间的内容
+function blockSpans(content, id) {
+  const begin = "<!-- jc:begin id=" + id + " -->";
+  const end = "<!-- jc:end id=" + id + " -->";
+  const i = content.indexOf(begin);
+  const j = content.indexOf(end);
+  if (i < 0 || j < 0 || j < i) return null;
+  return { bStart: i, bEnd: i + begin.length, eStart: j, eEnd: j + end.length };
+}
+
+function cmdFixWritten(vault, args) {
+  const ids = String(typeof args.id === "string" ? args.id : "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (ids.length === 0) {
+    fail("--fix-written 需要 --id=<块 id>（可逗号分隔多个）。块 id 见 jc:begin 标记，形如 20260916-1549-0882");
+  }
+  let pairs;
+  try {
+    pairs = parseReplaceList(args.replace);
+  } catch (e) {
+    fail(String((e && e.message) || e));
+  }
+
+  // 块 id 里已经含日期，不必自己算 ISO 周，直接全库找标记
+  const search = evalInObsidian(
+    vault,
+    "globalThis.__DJ_P = " + JSON.stringify({ ids: ids }) + ";\n" + SEARCHID_PAYLOAD,
+  );
+  const byPath = new Map();
+  for (const f of search.found) {
+    if (!byPath.has(f.path)) byPath.set(f.path, []);
+    byPath.get(f.path).push(f.id);
+  }
+  const missing = ids.filter((id) => !search.found.some((f) => f.id === id));
+  if (missing.length > 0) {
+    fail("这些块 id 在库里找不到：" + missing.join("、") + "\n  （用 grep -rn 'jc:begin id=' 核对一下）");
+  }
+
+  const reports = [];
+  const plans = [];
+  for (const [rel, fileIds] of byPath) {
+    const rr = evalInObsidian(
+      vault,
+      "globalThis.__DJ_P = " + JSON.stringify({ path: rel }) + ";\n" + READFILE_PAYLOAD,
+    );
+    if (!rr.ok) fail("读不到 " + rel + "：" + rr.error);
+    let content = rr.content;
+    let after = content;
+    const changed = [];
+
+    for (const id of fileIds) {
+      const sp = blockSpans(after, id);
+      if (!sp) fail("块标记不成对：" + id + " in " + rel + "（orphan-index-markers）");
+      const oldBody = after.slice(sp.bEnd + 2, sp.eStart - 2);
+      let newBody = oldBody;
+      const hits = [];
+      for (const p of pairs) {
+        const n = countOf(newBody, p.from);
+        if (n > 0) {
+          newBody = replaceAllText(newBody, p.from, p.to);
+          hits.push({ from: p.from, to: p.to, n: n });
+        }
+      }
+      if (hits.length === 0) {
+        reports.push({ id: id, path: rel, hits: [], skipped: "该块内没有命中" });
+        continue;
+      }
+
+      // 反向回代必须逐字节回到原文 —— 这是「除了这些对，什么都没动」的硬证据
+      let back = newBody;
+      for (const h of hits) back = replaceAllText(back, h.to, h.from);
+      if (back !== oldBody) {
+        fail(
+          "回代校验失败：" + id + "\n  替换不是干净的字面替换（右值在原文中也出现过，会互相干扰）。" +
+            "\n  请换更长的上下文再试，不要用会撞车的对。",
+        );
+      }
+
+      const oldId = id;
+      const newHash = crypto.createHash("sha1").update(newBody, "utf8").digest("hex").slice(0, 4);
+      const newId = id.slice(0, id.length - 5) + "-" + newHash;
+
+      after =
+        after.slice(0, sp.bStart) +
+        "<!-- jc:begin id=" + newId + " -->\n\n" +
+        newBody +
+        "\n\n<!-- jc:end id=" + newId + " -->" +
+        after.slice(sp.eEnd);
+
+      changed.push({ id: oldId, newId: newId, hits: hits, before: oldBody, after: newBody });
+      reports.push({ id: oldId, newId: newId, path: rel, hits: hits, before: oldBody, after: newBody });
+    }
+
+    if (changed.length === 0) continue;
+
+    // 索引行里的 id 一起换（旧格式裹反引号，新格式也是）
+    for (const c of changed) {
+      after = replaceAllText(after, "`" + c.id + "`", "`" + c.newId + "`");
+    }
+
+    // 块外必须逐字节不变：把块内替换全部还原后，应正好等于原文
+    let restored = after;
+    for (const c of changed) {
+      restored = replaceAllText(restored, c.after, c.before);
+      restored = replaceAllText(restored, "<!-- jc:begin id=" + c.newId + " -->", "<!-- jc:begin id=" + c.id + " -->");
+      restored = replaceAllText(restored, "<!-- jc:end id=" + c.newId + " -->", "<!-- jc:end id=" + c.id + " -->");
+      restored = replaceAllText(restored, "`" + c.newId + "`", "`" + c.id + "`");
+    }
+    const outsideUntouched = restored === content;
+
+    plans.push({ rel: rel, expectBefore: content, after: after, outsideUntouched: outsideUntouched, changed: changed });
+  }
+
+  const anyHit = reports.some((r) => (r.hits || []).length > 0);
+  if (!anyHit) {
+    process.stdout.write("改写：没有命中任何待改内容，未落盘。\n");
+    return;
+  }
+
+  const bad = plans.filter((p) => !p.outsideUntouched);
+  if (bad.length > 0) {
+    fail(
+      "块外内容被牵连：" + bad.map((p) => p.rel).join("、") +
+        "\n  这是脚本的 bug，已中止未落盘。请把现场报给用户看。",
+    );
+  }
+
+  if (!args.write) {
+    if (args.json) process.stdout.write(JSON.stringify({ ok: true, dryRun: true, plans: reports }, null, 2) + "\n");
+    else {
+      process.stdout.write("改写已写入的原文（未落盘）\n\n");
+      for (const r of reports) {
+        if ((r.hits || []).length === 0) continue;
+        process.stdout.write("  " + r.path + "  " + r.id + " -> " + r.newId + "\n");
+        for (const h of r.hits) {
+          process.stdout.write("    命中 " + h.n + " 次：" + h.from + " → " + h.to + "\n");
+        }
+        process.stdout.write("    改前: " + r.before.replace(/\n/g, "\\n") + "\n");
+        process.stdout.write("    改后: " + r.after.replace(/\n/g, "\\n") + "\n\n");
+      }
+      process.stdout.write("块外逐字节未动。确认后加 --write 重跑。\n");
+    }
+    return;
+  }
+
+  // 落盘前留一份字节级备份（.daily-journal/ 是隐藏目录，Obsidian 不索引）
+  const bdir = path.join(search.root, ".daily-journal", "backup");
+  fs.mkdirSync(bdir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const p of plans) {
+    const b = path.join(bdir, path.basename(p.rel) + "." + stamp + ".bak");
+    fs.writeFileSync(b, p.expectBefore);
+    p.backup = b;
+  }
+
+  const written = [];
+  for (const p of plans) {
+    const res = evalInObsidian(
+      vault,
+      "globalThis.__DJ_P = " + JSON.stringify({ path: p.rel, expectBefore: p.expectBefore, after: p.after }) + ";\n" + FIXWRITTEN_PAYLOAD,
+    );
+    if (!res.ok) fail("落盘失败 " + p.rel + "：" + res.error);
+    if (!res.beforeMatched) fail("落盘前比对失败 " + p.rel + "：文件在读取后被改过，未写入（readback-mismatch）");
+    if (!res.readBackExact) fail("回读不一致 " + p.rel + "：写入未按预期生效。备份在 " + p.backup);
+    written.push({ path: p.rel, backup: p.backup, changed: p.changed.length });
+  }
+
+  if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "written", written: written, plans: reports }, null, 2) + "\n");
+  else {
+    process.stdout.write("改写完成\n\n");
+    for (const w of written) {
+      process.stdout.write("  " + w.path + "  改了 " + w.changed + " 个块\n    备份: " + w.backup + "\n");
+    }
+    for (const r of reports) {
+      if ((r.hits || []).length === 0) continue;
+      process.stdout.write("  " + r.id + " -> " + r.newId + "  " + r.hits.map((h) => h.from + "→" + h.to).join("、") + "\n");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 迁移：把派生层索引里的历史「分类」还原成裸标签
+//
+// 早期版本把分类写成 `work/sales`（裹反引号）。反引号让它成了行内代码而不是
+// 标签，于是这些分类从来没进过图谱。本模式只动**派生层**（agent 维护、可重建），
+// 一个字节的原文都不碰；改完每个标签仍要过 validateTags 那道闸。
+// ---------------------------------------------------------------------------
+
+const MIGRATE_LIST_PAYLOAD = String.raw`
+(async () => {
+  const P = globalThis.__DJ_P;
+  const out = [];
+  const prefix = P.folder + "/";
+  for (const f of app.vault.getMarkdownFiles()) {
+    if (f.path.indexOf(prefix) !== 0) continue;
+    if (f.path.slice(prefix.length).indexOf("/") >= 0) continue;
+    out.push({ path: f.path, content: await app.vault.cachedRead(f) });
+  }
+  return JSON.stringify({ ok: true, files: out, root: app.vault.adapter.basePath });
+})()
+`;
+
+const BT_CHAR = String.fromCharCode(96);
+
+// 索引行 = "| 时间 | 锚点 | 分类 | 关联 |"
+function splitIndexRow(line) {
+  if (line.charAt(0) !== "|" || line.charAt(line.length - 1) !== "|") return null;
+  const parts = line.slice(1, -1).split("|").map((s) => s.trim());
+  if (parts.length !== 4) return null;
+  if (!/^\d{2}:\d{2}$/.test(parts[0])) return null;
+  if (parts[1].length < 3 || parts[1].charAt(0) !== BT_CHAR || parts[1].charAt(parts[1].length - 1) !== BT_CHAR) return null;
+  return parts;
+}
+
+// 只认「每一段都裘了反引号」的旧格式；混写（已经是裸标签）直接返回 null，不动它
+function unwrapLegacyCategory(cat) {
+  const toks = cat.split(/\s+/).filter(Boolean);
+  if (toks.length === 0) return null;
+  const out = [];
+  for (const t of toks) {
+    if (t.length < 2 || t.charAt(0) !== BT_CHAR || t.charAt(t.length - 1) !== BT_CHAR) return null;
+    out.push(t.slice(1, -1));
+  }
+  return out;
+}
+
+function cmdMigrateTags(vault, args) {
+  let map = [];
+  if (typeof args.map === "string" && args.map.trim() !== "") {
+    try {
+      map = parseReplaceList(args.map);
+    } catch (e) {
+      fail(String((e && e.message) || e));
+    }
+  }
+
+  const dp = dailyPath(vault);
+  const slash = dp.lastIndexOf("/");
+  const folder = slash > 0 ? dp.slice(0, slash) : "";
+  if (folder === "") fail("定位不到日记目录（daily:path = " + dp + "）");
+
+  const listed = evalInObsidian(
+    vault,
+    "globalThis.__DJ_P = " + JSON.stringify({ folder: folder }) + ";\n" + MIGRATE_LIST_PAYLOAD,
+  );
+
+  const tagVocab = loadTags(vault, args);
+  const known = {
+    skeleton: new Set(tagVocab.tags.filter((t) => t.source === "skeleton").map((t) => t.tag)),
+    live: new Set(tagVocab.tags.filter((t) => t.source === "vault").map((t) => t.tag)),
+  };
+
+  const plans = [];
+  const rows = [];
+  for (const f of listed.files) {
+    const lines = f.content.split("\n");
+    let touched = false;
+    for (let i = 0; i < lines.length; i++) {
+      const parts = splitIndexRow(lines[i]);
+      if (!parts) continue;
+      const legacy = unwrapLegacyCategory(parts[2]);
+      if (!legacy) continue;
+
+      // 先套映射，再加 # ，再校验
+      const mapped = legacy.map((t) => {
+        let v = t;
+        for (const p of map) if (v === p.from) v = p.to;
+        return v;
+      });
+      const tags = mapped.map((t) => "#" + t);
+      const check = validateTags(tags.join(" "), known);
+      if (!check.ok) fail("迁移后不合法：" + f.path + " 第 " + (i + 1) + " 行 " + JSON.stringify(tags.join(" ")) + "\n  " + check.reason);
+      if (check.novel && check.novel.length > 0) {
+        fail(
+          "迁移后出现词表外的新标签（D5：必须先问用户）：" + check.novel.join("、") + "\n" + "  在 " + f.path + " 第 " + (i + 1) + " 行。若已确认，用 --map='旧→新' 指定，或加 --allow-new-tag。",
+        );
+      }
+
+      lines[i] = "| " + parts[0] + " | " + parts[1] + " | " + tags.join(" ") + " | " + parts[3] + " |";
+      touched = true;
+      rows.push({ path: f.path, line: i + 1, id: parts[1].slice(1, -1), from: parts[2], to: tags.join(" ") });
+    }
+    if (touched) plans.push({ rel: f.path, expectBefore: f.content, after: lines.join("\n") });
+  }
+
+  if (rows.length === 0) {
+    process.stdout.write("迁移：没有找到裹反引号的历史分类，无需迁移。\n");
+    return;
+  }
+
+  if (!args.write) {
+    if (args.json) process.stdout.write(JSON.stringify({ ok: true, dryRun: true, rows: rows }, null, 2) + "\n");
+    else {
+      process.stdout.write("迁移历史分类为裸标签（未落盘）\n\n");
+      for (const r of rows) {
+        process.stdout.write("  " + r.path + ":" + r.line + "  " + r.id + "\n    " + r.from + "  →  " + r.to + "\n");
+      }
+      process.stdout.write("\n只改派生层索引行的分类列，原文与关联列不动。确认后加 --write 重跑。\n");
+    }
+    return;
+  }
+
+  const bdir = path.join(listed.root, ".daily-journal", "backup");
+  fs.mkdirSync(bdir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const p of plans) {
+    const b = path.join(bdir, path.basename(p.rel) + "." + stamp + ".bak");
+    fs.writeFileSync(b, p.expectBefore);
+    p.backup = b;
+    const res = evalInObsidian(
+      vault,
+      "globalThis.__DJ_P = " + JSON.stringify({ path: p.rel, expectBefore: p.expectBefore, after: p.after }) + ";\n" + FIXWRITTEN_PAYLOAD,
+    );
+    if (!res.ok) fail("落盘失败 " + p.rel + "：" + res.error);
+    if (!res.beforeMatched) fail("落盘前比对失败 " + p.rel + "：文件在读取后被改过，未写入");
+    if (!res.readBackExact) fail("回读不一致 " + p.rel + "：备份在 " + p.backup);
+  }
+
+  if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "written", rows: rows }, null, 2) + "\n");
+  else {
+    process.stdout.write("迁移完成：" + rows.length + " 行\n\n");
+    for (const r of rows) process.stdout.write("  " + r.path + ":" + r.line + "  " + r.from + "  →  " + r.to + "\n");
+    for (const p of plans) process.stdout.write("  备份: " + p.backup + "\n");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 自检：块 id 是否仍与正文自洽
+//
+// id = <YYYYMMDD>-<HHmm>-<sha1(正文) 前 4 位>。只要有人动过正文而没重算 id，
+// 这个等式就断了。它是「原文有没有被静静改过」最便宜的一条证据。
+// 注意：id 是 agent 自己生成的 opaque 锚点，不是用户写的话，所以重算它
+// 不碰 R3。本模式只改 jc:begin/jc:end 两行与索引行里的 id 字符串。
+// ---------------------------------------------------------------------------
+
+const ID_BEGIN_RE = /^<!-- jc:begin id=(\d{8}-\d{4}-([0-9a-f]{4})) -->$/;
+
+function cmdVerifyIds(vault, args) {
+  const dp = dailyPath(vault);
+  const slash = dp.lastIndexOf("/");
+  const folder = slash > 0 ? dp.slice(0, slash) : "";
+  if (folder === "") fail("定位不到日记目录（daily:path = " + dp + "）");
+  const listed = evalInObsidian(
+    vault,
+    "globalThis.__DJ_P = " + JSON.stringify({ folder: folder }) + ";\n" + MIGRATE_LIST_PAYLOAD,
+  );
+
+  const rows = [];
+  const plans = [];
+  for (const f of listed.files) {
+    const lines = f.content.split("\n");
+    const stale = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(ID_BEGIN_RE);
+      if (!m) continue;
+      const endLine = "<!-- jc:end id=" + m[1] + " -->";
+      let j = -1;
+      for (let k = i + 1; k < lines.length; k++) {
+        if (lines[k] === endLine) {
+          j = k;
+          break;
+        }
+      }
+      if (j < 0) {
+        rows.push({ path: f.path, line: i + 1, id: m[1], ok: false, reason: "end 标记缺失" });
+        continue;
+      }
+      const body = lines.slice(i + 2, j - 1).join("\n");
+      const got = crypto.createHash("sha1").update(body, "utf8").digest("hex").slice(0, 4);
+      rows.push({ path: f.path, line: i + 1, id: m[1], stored: m[2], computed: got, ok: got === m[2] });
+      if (got !== m[2]) {
+        stale.push({ id: m[1], newId: m[1].slice(0, m[1].length - 5) + "-" + got, from: i, to: j });
+      }
+    }
+    if (stale.length === 0) continue;
+    for (const s of stale) {
+      lines[s.from] = "<!-- jc:begin id=" + s.newId + " -->";
+      lines[s.to] = "<!-- jc:end id=" + s.newId + " -->";
+    }
+    let after = lines.join("\n");
+    for (const s of stale) after = replaceAllText(after, BT_CHAR + s.id + BT_CHAR, BT_CHAR + s.newId + BT_CHAR);
+    // 块外必须逐字节未动：把上面三处 id 字符串全推回去，应正好等于原文
+    let restored = after;
+    for (const s of stale) {
+      restored = replaceAllText(restored, "<!-- jc:begin id=" + s.newId + " -->", "<!-- jc:begin id=" + s.id + " -->");
+      restored = replaceAllText(restored, "<!-- jc:end id=" + s.newId + " -->", "<!-- jc:end id=" + s.id + " -->");
+      restored = replaceAllText(restored, BT_CHAR + s.newId + BT_CHAR, BT_CHAR + s.id + BT_CHAR);
+    }
+    plans.push({ rel: f.path, expectBefore: f.content, after: after, stale: stale, untouched: restored === f.content });
+  }
+
+  const bad = rows.filter((r) => !r.ok);
+  const staleCount = plans.reduce((n, p) => n + p.stale.length, 0);
+
+  if (bad.length === 0) {
+    if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "consistent", blocks: rows.length, rows: rows }, null, 2) + "\n");
+    else process.stdout.write("id 自检：" + rows.length + " 个块全部与正文自洽 ✅\n");
+    return;
+  }
+
+  if (!args.write) {
+    if (args.json) process.stdout.write(JSON.stringify({ ok: false, status: "stale", blocks: rows.length, stale: bad, rows: rows }, null, 2) + "\n");
+    else {
+      process.stdout.write("id 自检：" + rows.length + " 个块，其中 " + bad.length + " 个与正文对不上\n\n");
+      for (const r of bad) {
+        process.stdout.write(
+          "  " + r.path + ":" + r.line + "  " + r.id + "\n    id 里的 hash " + (r.stored || "—") + "，正文实算 " + (r.computed || "—") + (r.reason ? "  " + r.reason : "") + "\n",
+        );
+      }
+      process.stdout.write("\n含义：这些块的正文在写入后被改过，或由旧版脚本写入。\n加 --write 把 id 重算成与正文一致（只改 id 字符串，正文一个字节不动）。\n");
+    }
+    process.exit(1);
+  }
+
+  const broken = plans.filter((p) => !p.untouched);
+  if (broken.length > 0) fail("块外内容被牵连：" + broken.map((p) => p.rel).join("、") + "\n  脚本 bug，已中止未落盘。");
+
+  const bdir = path.join(listed.root, ".daily-journal", "backup");
+  fs.mkdirSync(bdir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const healed = [];
+  for (const p of plans) {
+    const b = path.join(bdir, path.basename(p.rel) + "." + stamp + ".bak");
+    fs.writeFileSync(b, p.expectBefore);
+    const res = evalInObsidian(
+      vault,
+      "globalThis.__DJ_P = " + JSON.stringify({ path: p.rel, expectBefore: p.expectBefore, after: p.after }) + ";\n" + FIXWRITTEN_PAYLOAD,
+    );
+    if (!res.ok) fail("落盘失败 " + p.rel + "：" + res.error);
+    if (!res.beforeMatched) fail("落盘前比对失败 " + p.rel + "：文件在读取后被改过，未写入");
+    if (!res.readBackExact) fail("回读不一致 " + p.rel + "：备份在 " + b);
+    for (const s of p.stale) healed.push({ path: p.rel, id: s.id, newId: s.newId });
+  }
+
+  if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "healed", healed: healed, rows: rows }, null, 2) + "\n");
+  else {
+    process.stdout.write("id 已重算：" + staleCount + " 个块\n\n");
+    for (const h of healed) process.stdout.write("  " + h.path + "  " + h.id + " -> " + h.newId + "\n");
+    process.stdout.write("\n正文一个字节未动，只换了 id 字符串。\n");
+  }
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2));
   CLI_ARGS = args;
@@ -1039,19 +1647,32 @@ function main() {
         "",
         "  写入（默认 dry-run）:",
         "    --content=<文本> | --content-file=<路径> | --stdin",
-        "    --category=<域>/<锚点>    必填",
+        "    --category=<#标签...>     必填，分类列写裸标签，多个用空格分隔",
         "    --links=<[[a]]、[[b]]>    可选",
         "    --time=HH:MM              可选，默认当前（也接受 HHmm）",
         "    --date=YYYY-MM-DD         可选，默认今天（用于块 id）",
         "    --write                   落盘；缺省只出 diff",
         "  校对（不改写，只给建议）:",
         "    --proofread               检查输入准确性，列出疑似问题与建议",
+        "  改写已写入的原文（R3 的显式例外，默认 dry-run）:",
+        "    --fix-written             需要 --id 与 --replace；只动 jc:begin/jc:end 之间",
+        "    --id=<块 id>              可逗号分隔多个，形如 20260916-1549-0882",
+        "    --replace='错→对'          可逗号分隔多对；命中数会被验证，且必须能反向回代",
+        "    --write                   落盘（会先备份到 .daily-journal/backup/）",
+        "  迁移派生层的历史分类（默认 dry-run）:",
+        "    --migrate-tags            把索引里裹反引号的分类还原成裸标签",
+        "    --map='旧→新'             可逗号分隔多对，用于个别改写（如 life/HomeLab→life）",
+        "  自检:",
+        "    --verify-ids              校 jc 块的 id 是否仍与正文自洽；不一致退 1",
+        "    --write                   把对不上的 id 重算回一致（正文不动）",
         "    --fix=safe                写入时自动套用无损修正（行尾空白/重复虚词/大小写）",
         "    --fix=all                 写入时套用全部可机械修正项（含改字，需用户确认）",
         "    --fix=f1,f5               只套用指定项",
         "    --skip=wikilink-missing   屏蔽某类检查（逗号分隔，如 wikilink-missing,token）",
-        "  分类:",
-        "    --classify                对 --content 做分类判定，不写盘",
+        "  分类（标签，词表实时来自 Obsidian，不落配置）:",
+        "    --tags                    列出限定目录内的实时标签词表，不写盘",
+        "    --scope=<d1,d2,...>       限定目录；默认 " + DEFAULT_TAG_ROOTS.join(","),
+        "    --classify                对 --content 做标签候选判定，不写盘",
         "  审计:",
         "    --audit --from=YYYY-MM-DD --to=YYYY-MM-DD",
         "  通用:",
@@ -1067,6 +1688,21 @@ function main() {
   }
 
   // 审计模式不写盘，只需能调用 eval
+  if (args["fix-written"]) {
+    cmdFixWritten(vault, args);
+    return;
+  }
+
+  if (args["migrate-tags"]) {
+    cmdMigrateTags(vault, args);
+    return;
+  }
+
+  if (args["verify-ids"]) {
+    cmdVerifyIds(vault, args);
+    return;
+  }
+
   if (args.audit) {
     const registry = loadRegistry(vault, args);
     const p = localParts();
@@ -1085,24 +1721,75 @@ function main() {
 
   const content = readContent(args);
 
-  if (args.classify) {
-    if (content === null) fail("--classify 需要 --content / --content-file / --stdin");
-    const registry = loadRegistry(vault, args);
-    const code =
-      "globalThis.__DJ_P = " + JSON.stringify({ roots: registry.whitelistRoots }) + ";\n" + CLASSIFY_PAYLOAD;
-    const listed = evalInObsidian(vault, code);
-    const res = classify(content, registry, listed.files);
+  if (args.tags) {
+    const res = loadTags(vault, args);
     if (args.json) process.stdout.write(JSON.stringify(res, null, 2) + "\n");
     else {
-      process.stdout.write("分类: " + res.category + "  (来源: " + res.source + ")\n");
-      if (res.candidates && res.candidates.length > 0) {
-        process.stdout.write("候选 " + res.candidates.length + " 个:\n");
-        for (const c of res.candidates) {
-          process.stdout.write("  - " + c.domain + "/" + c.anchor + "  " + c.path + "\n");
+      const sk = res.tags.filter((t) => t.source === "skeleton");
+      const lv = res.tags.filter((t) => t.source === "vault");
+      process.stdout.write("标签词表（限定目录 " + res.roots.join(" / ") + "）\n");
+      process.stdout.write(
+        "  骨架 " + res.skeletonCount + " 个（一级 " + res.level1Count + " + 二级 " + res.level2Count +
+          "）· 库内实有 " + res.liveCount + " 个 · 合计 " + res.count + " 个\n"
+      );
+      process.stdout.write(
+        "  剔除 #gtd/* " + (res.dropped.gtd || 0) + " 个、纯数字 " + (res.dropped.numeric || 0) +
+          " 个、单字符 " + (res.dropped.short || 0) + " 个\n\n"
+      );
+      process.stdout.write("【骨架 · 一级】\n");
+      for (const t of sk) {
+        if (t.level === 1) process.stdout.write("  " + t.tag + "\n");
+      }
+      process.stdout.write("\n【骨架 · 二级】\n");
+      for (const t of sk) {
+        if (t.level !== 2) continue;
+        process.stdout.write(
+          "  " + t.tag + (t.count > 0 ? "  (" + t.count + ")" : "") +
+            (t.notePath !== "" ? "  -> " + t.notePath : "") + "\n"
+        );
+      }
+      if (lv.length > 0) {
+        process.stdout.write("\n【库内实有 · 不在骨架】（分类可复用，但写盘要 --allow-new-tag）\n");
+        for (const t of lv) {
+          process.stdout.write(
+            "  " + t.tag + "  (" + t.count + ")" + (t.samples[0] ? "  " + t.samples[0] : "") + "\n"
+          );
         }
       }
-      if (res.needsUser) process.stdout.write("需要用户确认: 是\n");
     }
+    return;
+  }
+
+  if (args.classify) {
+    if (content === null) fail("--classify 需要 --content / --content-file / --stdin");
+    const vocab = loadTags(vault, args);
+    const cands = suggestTags(content, vocab.tags);
+    const res = {
+      ok: true,
+      roots: vocab.roots,
+      vocabularyCount: vocab.count,
+      candidates: cands,
+      placeholder: PLACEHOLDER_TAG,
+      needsUser: true,
+      note:
+        cands.length === 0
+          ? "词表内没有可命中的标签。标签可以新建，但必须先把建议的标签给用户确认（D5）。"
+          : "命中来自「骨架 ∪ 库内实有」词表。按 D5 逐条给用户确认，不要静默挑一个。",
+    };
+    if (args.json) process.stdout.write(JSON.stringify(res, null, 2) + "\n");
+    else if (cands.length === 0) {
+      process.stdout.write("分类候选: 无（限定目录内没有可命中的现成标签，可新建，但要用户点头）\n");
+    } else {
+      process.stdout.write("分类候选 " + cands.length + " 个（词表 " + res.vocabularyCount + " 个）:\n");
+      for (const c of cands) {
+        process.stdout.write(
+          "  - " + c.tag + "  [" + c.source + "/" + c.kind + ":" + c.matched + "]" +
+            (c.count > 0 ? "  (" + c.count + ")" : "") +
+            (c.notePath !== "" ? "  -> " + c.notePath : (c.samples[0] ? "  " + c.samples[0] : "")) + "\n"
+        );
+      }
+    }
+    process.stdout.write("需要用户确认: 是（D5：候选也要用户点头）\n");
     return;
   }
 
@@ -1137,13 +1824,27 @@ function main() {
 
   // 写入模式
   if (content === null) fail("缺少内容：请给 --content / --content-file / --stdin");
-  if (typeof args.category !== "string" || args.category.length === 0) fail("缺少 --category=<域>/<锚点>");
-  const catCheck = validateCategory(args.category, loadRegistry(vault, args), vault);
+  if (typeof args.category !== "string" || args.category.length === 0) {
+    fail("缺少 --category=<#标签...>（分类列写裸标签，可多个）");
+  }
+  const tagVocab = loadTags(vault, args);
+  const knownTags = {
+    skeleton: new Set(tagVocab.tags.filter((t) => t.source === "skeleton").map((t) => t.tag)),
+    live: new Set(tagVocab.tags.filter((t) => t.source === "vault").map((t) => t.tag)),
+  };
+  const catCheck = validateTags(args.category, knownTags);
   if (!catCheck.ok) {
     fail(
       "--category 不合法：" +
         catCheck.reason +
-        "\n  （D5：不静默降级。先跑 --classify 拿合法分类，或核对 05-分类词表 §五/§六）",
+        "\n  （D5：不静默降级。先跑 --tags 看词表、--classify 看候选）",
+    );
+  }
+  if (catCheck.novel.length > 0 && !args["allow-new-tag"]) {
+    fail(
+      "--category 里有词表外的新标签：" + catCheck.novel.join("、") +
+        "\n  新标签是允许的，但**必须先问用户**。用户点头后加 --allow-new-tag 重跑。" +
+        "\n  （D5：不静默降级，也不静默扩张词表）",
     );
   }
 

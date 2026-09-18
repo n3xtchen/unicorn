@@ -8,11 +8,11 @@ description: Capture text verbatim into today's Obsidian daily journal (02-Done)
 Append what the user gives you **verbatim** into today's daily note in the `nextlink` vault, then attach a classification and links in a separate, rebuildable derived layer.
 
 Read [decision-log.md](references/decision-log.md) before changing this skill or when a write boundary is ambiguous.
-Classification rules are generated into `registry.json`, which describes one concrete vault and is therefore generated **per vault**; vault/CLI facts in [vault-conventions.md](references/vault-conventions.md).
+分类是**库内实时标签**：词表 = 文档里维护的一二级骨架 ∪ 限定目录内实有的标签，**不由封闭配置文件决定**（封闭配置会过期）。`registry.json` 由 `05-分类词表.md` 机械派生，现在产两样东西：**标签骨架**（分类用）与**拼写词表**（校对用）。vault/CLI 事实见 [vault-conventions.md](references/vault-conventions.md)。
 
 ## registry：按 vault 生成，缺失就自动重建
 
-`registry.json` 是 vault 内「分类词表」的**机械派生物**，描述的是**具体某个 vault 的笔记结构**，所以按 vault 各自生成，不随仓库分发。仓库里只有 [registry.template.json](references/registry.template.json)（结构模板）与 [taxonomy.template.md](references/taxonomy.template.md)（词表模板）。
+`registry.json` 曾经是封闭的分类词表；**现在分类改成多级标签，它改为产出「标签骨架 + 校对拼写词表」**。它描述的是**具体某个 vault 的笔记结构**，所以按 vault 各自生成，不随仓库分发。仓库里只有 [registry.template.json](references/registry.template.json)（结构模板）与 [taxonomy.template.md](references/taxonomy.template.md)（词表模板）。
 
 **不要手抄生成命令**，也不要把命令丢给用户。脚本自己会重建：
 
@@ -36,7 +36,8 @@ Classification rules are generated into `registry.json`, which describes one con
 
 生成器不按项目路径硬编码，而是在 vault 内搜 `**/tools/build-registry.mjs`（与「分类词表」同目录，上限 6 层）。它逐条校验锚点路径真实存在，任一不存在即退出 1。vault 根一律向 Obsidian 索取（`app.vault.adapter.basePath`），不自行拼接 iCloud 路径。
 
-**改分类规则**：改 vault 里的 `05-分类词表.md`（唯一权威），然后 `--rebuild-registry`。
+**改校对词表或标签骨架**：改 vault 里的 `05-分类词表.md`（唯一权威），然后 `--rebuild-registry`。
+**只用库里已有的标签分类，不需要重建** —— 那部分是实时读的，改了标签立刻生效。
 
 ## Hard rules
 
@@ -116,26 +117,58 @@ scripts/journal_apply.mjs --proofread --content-file=/tmp/dj-capture.txt
 scripts/journal_create.sh            # prints e.g. 02-Done/2026-09-38w-16.md
 ```
 
-### 4. Classify
+### 4. Classify（标签，实时词表）
+
+分类是**真实的多级 Obsidian 标签**（`#work/sales`），裸写在「分类」列，不是 `<域>/<锚点>` 代码片段，也**不需要有对应的笔记文件存在**。
+
+词表有**两个来源，合起来用**：
+
+| 来源 | 内容 | 特点 |
+| --- | --- | --- |
+| 文档骨架 | 一级 9 个 + 二级 83 个 = 92 个 | 在 `05-分类词表.md` 里维护，稳定可评审 |
+| 实时库标签 | 限定目录内实有的标签 | 从 Obsidian 元数据缓存读，**不用维护、永不陈旧** |
 
 ```bash
+# 看完整词表（骨架分组 + 库内实有）
+scripts/journal_apply.mjs --tags
+
+# 拿本次捕获的候选（标签名与锚点关键词都会命中）
 scripts/journal_apply.mjs --classify --content-file=/tmp/dj-capture.txt --json
 ```
 
-Output tells you the `category` (`<域>/<锚点>`), the `source` (`registry` / `basename` / `none`), and `candidates`.
+默认只扫这 5 个目录（`--scope=` 可覆盖）：
 
-- `needsUser: false` and a single candidate → proceed.
-- `ambiguous: true` → **ask the user**, listing every candidate with its path. Do not pick silently.
-- `source: "none"` → fall back to a domain leaf from `leavesByDomain` only if the domain is obvious from the user's words; otherwise ask. Use `unsorted/-` as a placeholder only while asking.
+```text
+00-InBox&FleetNote  02-Done  09-Note4LLM  10-GTD  11-Knowledge
+```
 
-At write time `--category` is **validated mechanically**: the domain must be one of the nine, and the anchor must be a registry entry, a leaf of that domain, or an existing note basename. Anything else exits 1 without writing. **Never invent a classification.**
+自动剔除三类。这三条是**机械规则，不是要维护的配置**：
+
+- `#gtd` / `#gtd/*` —— 任务状态（`next-action` / `wait-for` / `calendar`…），不是主题分类。你日记的 tasks 区里就有一堆。
+- 纯数字标签 —— 来自 GitHub 链接标题（`· Issue #2672 ·`），Obsidian 会把它们当标签。
+- 单字符标签 —— 代码/链接噪声（例 `#n` 来自 Jupyter 笔记里的 JSON）。
+
+**候选为空是常态**：限定目录里的现成标签很少（实测 27 个）。标签可以**新建**，这正是标签相对「必须有对应文件」的好处。但按 D5：
+
+- 有候选 → 把候选**连同样例路径**给用户，**不要静默挑一个**。
+- 无候选 → 提 1–3 个建议标签（可复用现成的，也可新建），**问用户**。
+- 实在定不了 → 用 `#unsorted` 占位（它就是骨架里的一级标签），并明确告诉用户。
+
+写盘时 `--category` 会做**机械校验**，不合法就退出 1，不写盘：
+
+- 每个都必须是以 `#` 开头的合法标签，且不是上面剔除的三类。
+- 命中骨架或库内实有 → 直接通过。
+- **两者都不是 → 视为新建，必须带 `--allow-new-tag`**。这个旗标就是 D5 的机械闸门：脚本不替用户拍板，你也只能先问过用户才加它。
+
+可以给多个：`--category='#work/sales #work/shops'`。
+写进派生层的裸标签会在下一轮自动进入「实时」词表 —— 分类会自己长出来，不需要回头改文档。
 
 ### 5. Show the diff
 
 ```bash
 scripts/journal_apply.mjs \
   --content-file=/tmp/dj-capture.txt \
-  --category=<域>/<锚点> \
+  --category='#门店 #数仓' \
   --links='[[a]]、[[b]]'
 ```
 
@@ -149,23 +182,83 @@ Re-run the same command with `--write`. Confirm the output says `status: written
 
 ### 7. Report back
 
-Tell the user: the target path, the block `id`, the chosen category, any candidates you had to break a tie between, and — if the category came from a domain leaf rather than a real note — suggest creating a note for it once that leaf has appeared three times.
+Tell the user: the target path, the block `id`, the chosen tag(s), which candidate you picked (or that the tag is newly invented), and any candidate you had to break a tie between.
 
 ## Repeating
 
 Each additional capture in the same conversation is a new block appended after the previous one, plus a new row in the derived index table. Re-running the exact same text is idempotent and reports `duplicate`.
 
+## 事后修正：改已写入的原文
+
+R3 说原文逐字不改。**唯一的例外是用户自己事后要求修正错字** —— 这不是放宽 R3，而是同一件事的另一面。三条约束一字不变：脚本机械执行、模型不产出最终文本、只动 `jc:begin`/`jc:end` 之间。
+
+```bash
+# 先 dry-run（默认），看清改前 / 改后
+scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便宜→漂移'
+
+# 确认后落盘（自动备份到 .daily-journal/backup/）
+scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便宜→漂移' --write
+```
+
+**必须指定 `--id`。** 同一个词在不同块里含义可能不同：「便宜」在这一块是错字，在另一块「贪小便宜」是真词。无脑全库替换会改坏真词。
+
+脚本做四件事，任何一件不过就不写：
+
+1. **命中数校验** —— 报出每个对在该块内命中几次；
+2. **反向回代守卫** —— 把改后正文反向换回来必须逐字节等于改前。右值在原文里本来就出现过时，替换会互相干扰，直接拒绝；
+3. **块外不动** —— 把块内替换全部推回去后必须正好等于原文；
+4. **id 重算** —— 正文变了 sha1 就变，id 必须跟着改（含索引行），否则「同内容 → 同 id」的幂等前提就断了。
+
+**模型绝不可以自己改日记文件。** 哪怕只改一个字，也必须走这条路径；否则「原文逐字不改」就变成一句空话。
+
+## 自检：块 id 是否仍与正文自洽
+
+```bash
+scripts/journal_apply.mjs --verify-ids          # 只报告，不一致退 1
+scripts/journal_apply.mjs --verify-ids --write  # 把对不上的 id 重算回一致（正文不动）
+```
+
+`id = <YYYYMMDD>-<HHmm>-<sha1(正文) 前 4 位>`。等式断了就说明正文在写入后被改过，或者来自旧版脚本。这是「原文有没有被悄悄改过」最便宜的一条证据。
+
+id 是 agent 生成的 opaque 锚点、不是用户写的话，所以重算它不触碰 R3 —— 但正文仍必须逐字节不变，脚本会自己验证。
+
+## 迁移派生层的历史分类
+
+早期版本把分类写成 `` `work/sales` ``（裹反引号），那不是标签，从来没进过图谱。**不要手改**，用迁移模式：
+
+```bash
+scripts/journal_apply.mjs --migrate-tags --map='life/HomeLab→life'         # dry-run
+scripts/journal_apply.mjs --migrate-tags --map='life/HomeLab→life' --write
+```
+
+它只改派生层索引行的分类列（原文与关联列一个字节不动），且每个结果标签仍要过 `validateTags`；出现词表外的新标签会被拦下（D5）。混写的行（分类列里已经有裸标签）不会被碰。
+
 ## Other modes
 
 ```bash
+# 列出词表（骨架 + 限定目录内实有），不写盘
+scripts/journal_apply.mjs --tags --json
+
+# 只对另外几个目录取词表
+scripts/journal_apply.mjs --tags --scope='04-OnlyWork,08-Learning'
+
 # 只校对，不写入；把发现当 JSON 拿来做后续处理
 scripts/journal_apply.mjs --proofread --content-file=/tmp/dj-capture.txt --json
 
-# List everything still parked at unsorted/- in a date range
+# List everything still parked at #unsorted in a date range
 scripts/journal_apply.mjs --audit --from=2026-09-01 --to=2026-09-30 --json
 
 # Locate today's note without creating it
 scripts/journal_path.sh
+
+# 校块 id 与正文是否自洽（只读，不一致退 1）
+scripts/journal_apply.mjs --verify-ids
+
+# 把派生层裘反引号的历史分类迁移成裸标签（dry-run）
+scripts/journal_apply.mjs --migrate-tags --map='life/HomeLab→life'
+
+# 事后改已写入的原文里的错字（dry-run）
+scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便宜→漂移'
 ```
 
 ## Failure modes
@@ -175,11 +268,18 @@ scripts/journal_path.sh
 | `Obsidian 未运行` | Start Obsidian. Do not retry with a direct file write. |
 | `section-missing` | The note lacks `## 今日的思考` or `### 关联笔记`. Look at the note with the user before doing anything. |
 | `id-collision` | Same id, different text. Report both and ask; never overwrite. |
-| `--category 不合法` | 域不在 9 域闭集内，或锚点既不在注册表 / 域叶子，也不是库中已有笔记名。先跑 `--classify`，不要臆造。 |
+| `--category 不合法` | 不是合法标签，或是被剔除的 `#gtd/*` / 纯数字 / 单字符标签。先跑 `--tags` 与 `--classify`，不要臆造。 |
+| `--category` 里有词表外的新标签 | 缺 `--allow-new-tag`。这是 D5 的机械闸门：**先问用户**，点头后再加旗标重跑。 |
 | `pre-write-verify-failed` | A verbatim/idempotency check failed. Nothing was written. Report the failed flag. |
 | `orphan-index-markers` | The derived-layer markers are half-present. Ask the user before repairing. |
 | `readback-mismatch` | Something else wrote to the note concurrently. Stop and inspect. |
+| `回代校验失败` | `--fix-written` 的右值在原文里本来就出现过，替换会互相干扰。换更长的上下文再试，不要用会撞车的对。 |
+| `块外内容被牵连` | 脚本 bug，已中止未落盘。把现场给用户看，不要自己绕过去。 |
+| `迁移后不合法` / `迁移后出现词表外的新标签` | `--migrate-tags` 会被拦下。用 `--map` 指定映射，或先问用户再 `--allow-new-tag`。 |
+| `--fix-written 需要 --id` | 没给块 id。先 `grep -rn 'jc:begin id='` 找到它，**不要**改成全库替换。 |
 
 ## Fixing a wrong classification
 
-Edit the 「分类」 column in the derived layer directly. It is agent-maintained and rebuildable; the original text and the marker blocks must stay untouched.
+Edit the 「分类」 column in the derived layer directly — it holds bare tag(s) (e.g. `#work/sales #门店`), **not** wrapped in backticks, otherwise Obsidian will not treat them as tags. It is agent-maintained and rebuildable; the original text and the marker blocks must stay untouched.
+
+旧日记里可能还留着裹反引号的旧格式（`` `work/sales` ``），那不是标签，不会进图谱。**不要手改**，用 `--migrate-tags`（见上一节）。

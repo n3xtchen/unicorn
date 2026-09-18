@@ -11,34 +11,54 @@
     "所有 path 均为 vault 内相对路径，校验时要求真实存在。",
     ""
   ],
-
   "version": 1,
   "generatedFrom": "05-分类词表.md",
-
-  "domains": ["<域1>", "<域2>", "..."],
-
+  "domains": [
+    "<域1>",
+    "<域2>",
+    "..."
+  ],
   "domainPaths": {
-    "<域1>": ["<path-prefix>/", "<另一个-prefix>/"],
-    "<域2>": ["<path-prefix>/"]
+    "<域1>": [
+      "<path-prefix>/",
+      "<另一个-prefix>/"
+    ],
+    "<域2>": [
+      "<path-prefix>/"
+    ]
   },
-
   "catchAll": {
     "<兜底域>": "<最低优先级的 path-prefix>/"
   },
-
-  "whitelistRoots": ["<允许解析锚点的根目录>/", "<...>/"],
-
+  "whitelistRoots": [
+    "<允许解析锚点的根目录>/",
+    "<...>/"
+  ],
   "leaves": {
-    "<域1>": ["<叶子1>", "<叶子2>"],
-    "<域2>": ["<叶子1>"]
+    "<域1>": [
+      "<叶子1>",
+      "<叶子2>"
+    ],
+    "<域2>": [
+      "<叶子1>"
+    ]
   },
-
+  "tagSkeleton": {
+    "_comment": "分类用的多级标签骨架。level1 = §二 的域，level2 = §六 锚点 + §五 叶子。构建时由 tools/build-registry.mjs 机械派生并校验重名。",
+    "level1": [],
+    "level2": {},
+    "all": [],
+    "paths": {}
+  },
   "anchors": [
     {
       "anchor": "<锚点名，用笔记 basename 原文>",
       "path": "<vault 内相对路径，必须以 .md 结尾>",
       "domain": "<域1>",
-      "keywords": ["<触发关键词1>", "<触发关键词2>"]
+      "keywords": [
+        "<触发关键词1>",
+        "<触发关键词2>"
+      ]
     }
   ]
 }
