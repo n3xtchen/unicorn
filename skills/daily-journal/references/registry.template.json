@@ -1,0 +1,44 @@
+{
+  "_template": true,
+  "_comment": [
+    "这是 registry.json 的结构模板，不是可运行的实例。",
+    "真实实例描述具体某个 vault 的笔记结构，由 vault 内的生成器从「分类词表」机械产出：",
+    "  node <vault>/09-Note4LLM/productivity/projects/<项目>/tools/build-registry.mjs \\",
+    "    --vault-root=<vault 绝对路径> --out=<实例落点>",
+    "落点优先级：--registry > $DJ_REGISTRY > <vault>/.daily-journal/registry.json",
+    "            > <vault>/registry.json > $XDG_STATE_HOME/daily-journal/<vault>.registry.json",
+    "            > <skill>/references/registry.json（旧布局）",
+    "所有 path 均为 vault 内相对路径，校验时要求真实存在。",
+    ""
+  ],
+
+  "version": 1,
+  "generatedFrom": "05-分类词表.md",
+
+  "domains": ["<域1>", "<域2>", "..."],
+
+  "domainPaths": {
+    "<域1>": ["<path-prefix>/", "<另一个-prefix>/"],
+    "<域2>": ["<path-prefix>/"]
+  },
+
+  "catchAll": {
+    "<兜底域>": "<最低优先级的 path-prefix>/"
+  },
+
+  "whitelistRoots": ["<允许解析锚点的根目录>/", "<...>/"],
+
+  "leaves": {
+    "<域1>": ["<叶子1>", "<叶子2>"],
+    "<域2>": ["<叶子1>"]
+  },
+
+  "anchors": [
+    {
+      "anchor": "<锚点名，用笔记 basename 原文>",
+      "path": "<vault 内相对路径，必须以 .md 结尾>",
+      "domain": "<域1>",
+      "keywords": ["<触发关键词1>", "<触发关键词2>"]
+    }
+  ]
+}
