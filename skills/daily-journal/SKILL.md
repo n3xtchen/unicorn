@@ -44,7 +44,8 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 
 ## Hard rules
 
-1. **原文逐字不改（R3）.** Never paraphrase, fix typos, reorder, reformat, dedent, or "improve" the user's text. Copy it byte for byte, including `==highlights==`, tabs, and typos. No timestamp prefix.
+1. **原文逐字不改（R3）.** Never paraphrase, reorder, reformat, dedent, or "improve" the user's text. 照抄时逐字节照抄，**包括** `==highlights==`、Tab 缩进、以及打错的字。没有时间戳前缀。
+   R3 管的是**照抄这个动作** —— 不允许你在抄写时顺手改。唯一例外是一道**独立、用户授权**的工序：用户事后显式要求改错字，或第 2 步你查出、且**用户点头**的中文别字。两者都走 `--fix-pair` / `--fix-written`，不走你手写。
 2. **默认 dry-run（D3）.** Show the diff first. Only run with `--write` after the user confirms.
 3. **不确定就问（D5）.** If the classification, the anchor, or the target note is uncertain, stop and ask. Never guess and never silently leave something `unsorted`.
 4. **Never touch `### 关联笔记`** (the dataviewjs block), the tasks blocks, or any other note.
@@ -66,9 +67,11 @@ cat > /tmp/dj-capture.txt <<'EOF'
 EOF
 ```
 
-### 2. 校对用户输入（先查，再问）
+### 2. 校对用户输入（两轮：脚本查格式，你查中文，合成一张清单）
 
-动笔之前先机械地查一遍原文，把可疑处摆给用户看。这一步**只报告，不改写**，可以随便跑。
+动笔之前查两遍原文。这一步**只报告，不改写**，可以随便跑。
+
+#### 第一轮 · 脚本查格式
 
 ```bash
 scripts/journal_apply.mjs --proofread --content-file=/tmp/dj-capture.txt
@@ -76,20 +79,45 @@ scripts/journal_apply.mjs --proofread --content-file=/tmp/dj-capture.txt
 
 输出按严重度列出每条，并标出处置方式：`[建议直改]` / `[需确认]` / `[只能手改]`。
 
-- **有发现** → 把清单原样念给用户，逐条问。不要自己决定。
-- **没有发现** → 直接进入下一步。
+#### 第二轮 · 你自己读一遍中文
 
-用户确认后，用 `--fix` 让**脚本**做机械替换（不是你来改）：
+脚本**查不出中文别字**：`cjk-typo` 因噪声太高已被实测否决，`ascii-typo` 只管英文词。
+用户最容易犯的同音字（`便宜`/`漂移`、`系统出`/`系统里`）从原理上就抓不到 —— 这一轮只能你来。
 
-```bash
---fix=safe        # 只做无损修正：行尾空白、重复虚词（的的）、大小写规范
---fix=all         # 连「改字」也算上（ascii-typo），必须先逐条得到同意
---fix=f2,f5       # 只套用指定条目
---fix=safe --skip=trailing-space   # --skip 可关掉某类检查
+读的时候只做一件事：**找出读不通的地方，给出「错→对」对和理由。**
+
+```text
+便宜   → 漂移    上下文在讲上下文压缩，「防止便宜」语义不通
+系统出 → 系统里  「在 Mac 系统出设置 bypass」，介词位塌了
 ```
 
-`--fix` 在写入时生效，结果里的 `fixReport` 会列出实际替换了什么。
-**绝不要用 `--fix` 之外的任何方式改动原文** —— 你想「顺手润色」的那一下，正是 R3 要防的。
+三条红线：
+
+- **只给「对」，不给改后的整句。** 你一旦写出重写好的段落，就是 R3 要防的润色。
+- **不动风格。** `的地得`、口语化写法、生造词、专有名词、中英混排一律不碰 —— 那是品味，不是错。
+- **每对都要附理由**，用户才有得否决。报不准就别报：宁可漏，不能错。
+
+把两轮结果**并成一张清单**念给用户，逐条问。不要自己决定。
+
+- **有发现** → 逐条问，用户点头的才进下一步。
+- **没有发现** → 直接进入下一步。
+
+**落盘时按来源分两条通道，守卫一样**：
+
+```bash
+--fix=safe        # 脚本查出的无损项：行尾空白、重复虚词（的的）、大小写
+--fix=all         # 连脚本查出的「改字」（ascii-typo）也算上，必须先逐条得到同意
+--fix=f2,f5       # 只套用脚本查出的指定条目
+--fix-pair='系统出→系统里,便宜→漂移'   # 你提的中文对
+--fix=safe --skip=trailing-space      # --skip 可关掉某类检查
+```
+
+两条通道都要过**命中数验证 + 反向回代**。`--fix-pair` 里有一对没命中不是「跳过」，
+而是**报错退出** —— 那说明你读错了原文，不能默默放过。`--fix-pair` 先于 `--fix` 执行，
+因为它针对的是你读到的**原始文本**。
+
+结果里的 `fixReport` / `pairReport` 会列出实际替换了什么。
+**绝不要用这两条通道之外的任何方式改动原文** —— 你想「顺手润色」的那一下，正是 R3 要防的。
 如果用户说「我自己改」，就等他把改好的版本给你，重新走第 1 步。
 
 **检查项**：
@@ -106,9 +134,9 @@ scripts/journal_apply.mjs --proofread --content-file=/tmp/dj-capture.txt
 | `highlight-unclosed` | `==` 个数为奇数 | 只能手改 |
 | `fence-unclosed` | 代码围栏个数为奇数 | 只能手改 |
 
-**两件事是故意不做的，因为实测不成立：**
+**两件事是脚本故意不做的，因为实测不成立：**
 
-- **中文别字检测**（`cjk-typo`）。用 155 个词表词做近似匹配，在全库 3.83M 字上给出 9567 条，其中 3070 个不同的「错字窗口」**没有一个**在语料里出现 0 次 —— `笔记整` 本来就是 `笔记整理` 的子串。没有分词器/词典就无法区分。
+- **脚本里的中文别字检测**（`cjk-typo`）。识别这件事改由**模型**做（见上面的第二轮），脚本不碰 —— 但**脚本不碰的理由**必须记下来：用 155 个词表词做近似匹配，在全库 3.83M 字上给出 9567 条，其中 3070 个不同的「错字窗口」**没有一个**在语料里出现 0 次 —— `笔记整` 本来就是 `笔记整理` 的子串。没有分词器/词典就无法区分。
 - **`[[` / `]]` 成对检查**。全库 111 处全是误报：`[[白话解析] Flink…](url)` 是 markdown 链接文本，`[1]]` 是 Python 代码。
 
 宁可漏，不能错。一个 5‰ 密度的检查只会训练用户忽略它，而 `--fix=all` 会真的改坏文本。

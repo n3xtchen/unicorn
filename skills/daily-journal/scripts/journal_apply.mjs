@@ -1201,20 +1201,20 @@ const FIXWRITTEN_PAYLOAD = String.raw`
 })()
 `;
 
-function parseReplaceList(spec) {
+function parseReplaceList(spec, flag = "--replace") {
   if (typeof spec !== "string" || spec.trim() === "") {
-    throw new Error("--replace 为空（写法：--replace='便宜→偏移'）");
+    throw new Error(flag + " 为空（写法：" + flag + "='便宜→漂移'）");
   }
   const out = [];
   for (const part of spec.split(",")) {
     const s = part.trim();
     if (s === "") continue;
     const i = s.indexOf("→");
-    if (i < 0) throw new Error("--replace 缺少箭头 →：" + JSON.stringify(s));
+    if (i < 0) throw new Error(flag + " 缺少箭头 →：" + JSON.stringify(s));
     const from = s.slice(0, i);
     const to = s.slice(i + 1);
-    if (from === "") throw new Error("--replace 左侧为空：" + JSON.stringify(s));
-    if (to === "") throw new Error("--replace 右侧为空：" + JSON.stringify(s));
+    if (from === "") throw new Error(flag + " 左侧为空：" + JSON.stringify(s));
+    if (to === "") throw new Error(flag + " 右侧为空：" + JSON.stringify(s));
     if (from === to) throw new Error("--replace 两侧相同：" + JSON.stringify(s));
     out.push({ from: from, to: to });
   }
@@ -1468,7 +1468,7 @@ function cmdMigrateTags(vault, args) {
   let map = [];
   if (typeof args.map === "string" && args.map.trim() !== "") {
     try {
-      map = parseReplaceList(args.map);
+      map = parseReplaceList(args.map, "--map");
     } catch (e) {
       fail(String((e && e.message) || e));
     }
@@ -1727,6 +1727,7 @@ function main() {
         "    --fix=safe                写入时自动套用无损修正（行尾空白/重复虚词/大小写）",
         "    --fix=all                 写入时套用全部可机械修正项（含改字，需用户确认）",
         "    --fix=f1,f5               只套用指定项",
+        "    --fix-pair='错→对'        模型提的中文修正（脚本查不出别字）；每对必须命中，且必须能反向回代",
         "    --skip=wikilink-missing   屏蔽某类检查（逗号分隔，如 wikilink-missing,token）",
         "  分类（标签，词表实时来自 Obsidian，不落配置）:",
         "    --tags                    列出限定目录内的实时标签词表，不写盘",
@@ -1929,6 +1930,46 @@ function main() {
   }
 
   let finalContent = content;
+
+  // 模型提的「错→对」对（W1）。脚本查不出的中文别字走这条通道：
+  // 模型只出对与理由，替换由脚本做；每一对都必须命中，命中不到即拒绝 ——
+  // 那说明模型读错了原文，不能默默放过。
+  // 顺序在 --fix 之前：模型读的是原始文本，机械修正会先动它。
+  let pairReport = null;
+  if (typeof args["fix-pair"] === "string") {
+    let pairs;
+    try {
+      pairs = parseReplaceList(args["fix-pair"], "--fix-pair");
+    } catch (e) {
+      fail(String((e && e.message) || e));
+    }
+    const before = finalContent;
+    let after = before;
+    const applied = [];
+    for (const p of pairs) {
+      const n = countOf(after, p.from);
+      if (n === 0) {
+        fail(
+          "--fix-pair 没有命中：" + p.from + " → " + p.to +
+            "\n  原文里找不到「" + p.from + "」。这通常意味着模型读错了原文 —— 核对后重来，不要默默放过。",
+        );
+      }
+      after = replaceAllText(after, p.from, p.to);
+      applied.push({ from: p.from, to: p.to, n: n });
+    }
+    // 反向回代必须逐字节回到原文 —— 与 --fix-written 同一条硬证据
+    let back = after;
+    for (const a of applied) back = replaceAllText(back, a.to, a.from);
+    if (back !== before) {
+      fail(
+        "回代校验失败：--fix-pair 不是干净的字面替换（右值在原文中也出现过，会互相干扰）。" +
+          "\n  请换更长的上下文再试，不要用会撞车的对。",
+      );
+    }
+    pairReport = { applied: applied.map((a) => a.from + "→" + a.to), changed: after !== before };
+    finalContent = after;
+  }
+
   let fixReport = null;
   if (typeof args.fix === "string") {
     const pf = runProofread(vault, finalContent, skipSet(args));
@@ -1971,6 +2012,7 @@ function main() {
   const res = evalInObsidian(vault, code);
 
   if (fixReport) res.fixReport = fixReport;
+  if (pairReport) res.pairReport = pairReport;
 
   if (!res.ok && res.status !== "duplicate") {
     process.stderr.write(JSON.stringify(res, null, 2) + "\n");
@@ -1995,6 +2037,9 @@ function main() {
     process.stdout.write("状态: " + res.status + "  id: " + res.id + "  分类: " + res.category + "\n");
     if (res.fixReport && res.fixReport.changed) {
       process.stdout.write("修正: 已套用 " + res.fixReport.applied.length + " 处 -> " + res.fixReport.applied.join("、") + "\n");
+    }
+    if (res.pairReport && res.pairReport.changed) {
+      process.stdout.write("中文修正: 已套用 " + res.pairReport.applied.length + " 处 -> " + res.pairReport.applied.join("、") + "\n");
     }
     process.stdout.write("校验: " + JSON.stringify(res.verify) + "\n");
     if (diff) {
