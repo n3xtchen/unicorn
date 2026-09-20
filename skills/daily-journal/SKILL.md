@@ -50,6 +50,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 4. **Never touch `### 关联笔记`** (the dataviewjs block), the tasks blocks, or any other note.
 5. **No filesystem fallback.** If Obsidian is not running, stop and tell the user. Do not write the file directly — that would clobber unsaved editor content.
 6. **校对是独立的一步（R3 的补充）.** 你只能在用户**明确确认后**，用脚本对原文做**机械替换**；绝不自己改写。原文层最终收到的，是用户批准的那个版本。详见第 2 步。
+7. **关联列要填链接，但不硬凑（A1–A4）.** 原文里**实际点名**的实体，库里有对应笔记就链上（`--links`）；只有确实没有对应实体时才留 `—`。分类候选给的路径只是提示，不是填充项（词面命中 ≠ 实体关联）。目标必须真实存在 —— 脚本会拦（退出 7）。**不回溯**：只管新捕获与你点名要改的那条，历史条目一律不动。
 
 ## Workflow
 
@@ -157,6 +158,8 @@ scripts/journal_apply.mjs --classify --content-file=/tmp/dj-capture.txt --json
 - 无候选 → 提 1–3 个建议标签（可复用现成的，也可新建），**问用户**。
 - 实在定不了 → 用 `#unsorted` 占位（它就是骨架里的一级标签），并明确告诉用户。
 
+候选里带的路径只是提示：它说明库里**可能**有对应笔记，要不要链取决于原文是否真的点名了那个实体（见硬规则 7）。
+
 写盘时 `--category` 会做**机械校验**，不合法就退出 1，不写盘：
 
 - 每个都必须是以 `#` 开头的合法标签，且不是上面剔除的三类。
@@ -175,7 +178,9 @@ scripts/journal_apply.mjs \
   --links='[[a]]、[[b]]'
 ```
 
-`--links` is optional; it goes in the derived layer's 关联 column (keep it as the raw wikilink text, separated by `、`). Omit for `—`.
+`--links` 进派生层的关联列，写成原始 wikilink 文本，多个用 `、` 分隔。
+
+原文里**实际点名**的实体，库里有笔记就链（见硬规则 7）：有几个填几个。没有对应实体就留 `—`，但不要为了不留空硬凑。
 
 The command prints a unified diff and the `verify` object. **Check that all five flags are true**, especially `bodyExact` and `originalsPreserved`.
 

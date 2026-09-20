@@ -209,7 +209,7 @@ const WRITE_PAYLOAD = String.raw`
       "",
       "<!-- jc:index:begin -->",
       "| 时间 | 块 id | 分类 | 关联 |",
-      "|---|---|---|---|",
+      "| --- | --- | --- | --- |",
       row,
       "<!-- jc:index:end -->",
       ""
@@ -896,6 +896,35 @@ function skipSet(args) {
   if (typeof args.skip !== "string") return null;
   const s = new Set(args.skip.split(",").map((x) => x.trim()).filter(Boolean));
   return s.size ? s : null;
+}
+
+// 关联列只允许指向库里真实存在的文件（A3）。
+// 没有实际文档，关联就没有意义 —— 所以这条在写盘前机械拦下，不靠模型自觉。
+function parseWikilinkTargets(s) {
+  const out = [];
+  if (typeof s !== "string") return out;
+  const re = /\[\[([^\]]+)\]\]/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    // 去掉别名（|）与标题/块锚点（#）
+    const t = m[1].split("|")[0].split("#")[0].trim();
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+// returns { checked, missing[], malformed }
+function checkLinks(vault, links) {
+  if (typeof links !== "string") return { checked: 0, missing: [], malformed: false };
+  const stripped = links.replace(/[\s\u3001,\uFF0C]+/g, "");
+  if (!stripped || stripped === "\u2014" || stripped === "-") {
+    return { checked: 0, missing: [], malformed: false };
+  }
+  const targets = parseWikilinkTargets(links);
+  if (targets.length === 0) return { checked: 0, missing: [], malformed: true };
+  const idx = buildLinkIndex(listFiles(vault));
+  const missing = targets.filter((t) => !idx.targets.has(t.toLowerCase()));
+  return { checked: targets.length, missing: missing, malformed: false };
 }
 
 function listFiles(vault) {
@@ -1678,7 +1707,7 @@ function main() {
         "  写入（默认 dry-run）:",
         "    --content=<文本> | --content-file=<路径> | --stdin",
         "    --category=<#标签...>     必填，分类列写裸标签，多个用空格分隔",
-        "    --links=<[[a]]、[[b]]>    可选",
+        "    --links=<[[a]]、[[b]]>    可选；目标必须在库里真实存在，否则退出 7",
         "    --time=HH:MM              可选，默认当前（也接受 HHmm）",
         "    --date=YYYY-MM-DD         可选，默认今天（用于块 id）",
         "    --write                   落盘；缺省只出 diff",
@@ -1876,6 +1905,27 @@ function main() {
         "\n  新标签是允许的，但**必须先问用户**。用户点头后加 --allow-new-tag 重跑。" +
         "\n  （D5：不静默降级，也不静默扩张词表）",
     );
+  }
+
+  // 关联列只能链真实存在的文件；没有实际文档，关联就没有意义（A3）。
+  if (typeof args.links === "string" && args.links.trim()) {
+    const lc = checkLinks(vault, args.links);
+    if (lc.malformed) {
+      fail(
+        "--links 必须是 wikilink 形式，例：--links='[[🎁]]、[[🐱]]'" +
+          "\n  （关联列只放真实文件的链接，裸文字会变成无效关联）",
+        7,
+      );
+    }
+    if (lc.missing.length > 0) {
+      fail(
+        "--links 里有库里找不到的目标：" + lc.missing.map((t) => "[[" + t + "]]").join("、") +
+          "\n  关联列只允许链真实存在的文件（没有实际文档，关联就没有意义）。" +
+          "\n  要么去掉这些链接，要么先把对应笔记建好。" +
+          "\n  （解析规则同 Obsidian：全路径/文件名/frontmatter aliases 都算命中）",
+        7,
+      );
+    }
   }
 
   let finalContent = content;
