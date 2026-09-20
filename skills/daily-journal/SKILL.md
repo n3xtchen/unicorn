@@ -180,7 +180,7 @@ scripts/journal_apply.mjs --classify --content-file=/tmp/dj-capture.txt --json
 - 纯数字标签 —— 来自 GitHub 链接标题（`· Issue #2672 ·`），Obsidian 会把它们当标签。
 - 单字符标签 —— 代码/链接噪声（例 `#n` 来自 Jupyter 笔记里的 JSON）。
 
-**候选为空是常态**：限定目录里的现成标签很少（实测 27 个）。标签可以**新建**，这正是标签相对「必须有对应文件」的好处。但按 D5：
+**候选为空是常态**：限定目录里的现成标签很少（2026-09-20 实测 40 个，随库内标签随时变动，以 `--tags` 现查为准）。标签可以**新建**，这正是标签相对「必须有对应文件」的好处。但按 D5：
 
 - 有候选 → 把候选**连同样例路径**给用户，**不要静默挑一个**。
 - 无候选 → 提 1–3 个建议标签（可复用现成的，也可新建），**问用户**。
@@ -206,7 +206,12 @@ scripts/journal_apply.mjs \
   --links='[[a]]、[[b]]'
 ```
 
-`--links` 进派生层的关联列，写成原始 wikilink 文本，多个用 `、` 分隔。
+`--links` 进派生层的关联列。四条硬约束都在写盘前机械拦下（dry-run 阶段就报，退出 7）：
+
+- **必须是纯 wikilink 列表**，多个用 `、` 分隔。裸文字写不进去 —— 说明文字写到正文里。
+- **目标是真实文件**：按 Obsidian 的解析规则（全路径带/不带 `.md`、文件名、frontmatter `aliases`）解析不到就退出 7。
+- **单元格里的 `|` 要转义成 `\|`**（例 `--links='[[🎁\|礼物]]'`）。未转义的 `|` 会被 markdown 当成列分隔符，索引行从 4 列撑成 5 列、表格结构坏掉。
+- **不能含换行** —— 关联列是单个表格单元格。
 
 原文里**实际点名**的实体，库里有笔记就链（见硬规则 7）：有几个填几个。没有对应实体就留 `—`，但不要为了不留空硬凑。
 
@@ -308,6 +313,12 @@ scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便�
 | `--category` 里有词表外的新标签 | 缺 `--allow-new-tag`。这是 D5 的机械闸门：**先问用户**，点头后再加旗标重跑。 |
 | `pre-write-verify-failed` | A verbatim/idempotency check failed. Nothing was written. Report the failed flag. |
 | `orphan-index-markers` | The derived-layer markers are half-present. Ask the user before repairing. |
+| `index-markers-missing` | `jc:index` 标记整块缺失。不要自己补，先看库内实际状态再问用户。 |
+| `note-not-found` | 当日笔记不存在。先跑 `journal_create.sh`，或直接加 `--write` 让捕获路径建它。 |
+| `file-missing` | 目标笔记在写入瞬间消失了。查 vault 状态后重跑，不要回退到文件系统写入。 |
+| `--links 必须是纯 wikilink 列表` | 关联列只放链接。`问题：` 后面写明是「含换行」「\| 没有转义」「有裸文字」还是「一个 wikilink 都没有」（退出 7）。 |
+| `--links 里有库里找不到的目标` | 链接指向不存在的笔记。去掉它，或先把对应笔记建好（退出 7）。 |
+| `--fix-pair 没有命中` | 对里的左值在原文里找不到 —— 通常意味着模型读错了原文。核对后重来，不要默默放过。 |
 | `readback-mismatch` | Something else wrote to the note concurrently. Stop and inspect. |
 | `回代校验失败` | `--fix-written` 的右值在原文里本来就出现过，替换会互相干扰。换更长的上下文再试，不要用会撞车的对。 |
 | `块外内容被牵连` | 脚本 bug，已中止未落盘。把现场给用户看，不要自己绕过去。 |

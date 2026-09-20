@@ -935,30 +935,62 @@ function skipSet(args) {
 // 关联列只允许指向库里真实存在的文件（A3）。
 // 没有实际文档，关联就没有意义 —— 所以这条在写盘前机械拦下，不靠模型自觉。
 function parseWikilinkTargets(s) {
-  const out = [];
-  if (typeof s !== "string") return out;
+  const res = { targets: [], unescapedPipe: [] };
+  if (typeof s !== "string") return res;
   const re = /\[\[([^\]]+)\]\]/g;
   let m;
   while ((m = re.exec(s)) !== null) {
-    // 去掉别名（|）与标题/块锚点（#）
-    const t = m[1].split("|")[0].split("#")[0].trim();
-    if (t) out.push(t);
+    const inner = m[1];
+    // 表格单元格里的 | 必须先转义成 \|，否则 markdown 把它当列分隔符，索引行从 4 列撑成 5 列。
+    // 两个方向都要管：不拦 → 表格坏掉；不剥转义 → [[🎁\|礼物]] 会被认成不存在的文件名。
+    // 先判未转义，再剥转义 —— 顺序反过来就分不清「转义过的」和「本来就有两个」。
+    let bare = false;
+    for (let k = 0; k < inner.length; k++) {
+      if (inner[k] === "|" && (k === 0 || inner[k - 1] !== "\\")) { bare = true; break; }
+    }
+    if (bare) {
+      res.unescapedPipe.push(inner);
+      continue;
+    }
+    // 剥掉转义反斜杠（\| -> |），再切别名（|）与标题/块锚点（#）
+    const t = inner.split("\\|").join("|").split("|")[0].split("#")[0].trim();
+    if (t) res.targets.push(t);
   }
-  return out;
+  return res;
 }
 
-// returns { checked, missing[], malformed }
+// returns { checked, missing[], malformed, reason?, detail? }
 function checkLinks(vault, links) {
   if (typeof links !== "string") return { checked: 0, missing: [], malformed: false };
   const stripped = links.replace(/[\s\u3001,\uFF0C]+/g, "");
   if (!stripped || stripped === "\u2014" || stripped === "-") {
     return { checked: 0, missing: [], malformed: false };
   }
-  const targets = parseWikilinkTargets(links);
-  if (targets.length === 0) return { checked: 0, missing: [], malformed: true };
+  // 单元格里出现换行会把索引行折成两行 —— 直接判 malformed。
+  if (/[\r\n]/.test(links)) {
+    return { checked: 0, missing: [], malformed: true, reason: "含换行", detail: "关联列是单个表格单元格，不能换行。" };
+  }
+  const parsed = parseWikilinkTargets(links);
+  if (parsed.unescapedPipe.length > 0) {
+    return {
+      checked: 0, missing: [], malformed: true, reason: "| 没有转义",
+      detail: "表格单元格里的 | 要写成 \\|，否则索引行会多出一列。例：--links='[[🎁\\|礼物]]'",
+    };
+  }
+  if (parsed.targets.length === 0) {
+    return { checked: 0, missing: [], malformed: true, reason: "一个 wikilink 都没有" };
+  }
+  // 去掉 wikilink 和分隔符后还有残留 = 裸文字（它变成不了关联，只会写进表格）
+  const residue = links.replace(/\[\[[^\]]+\]\]/g, "").replace(/[\s\u3001,\uFF0C]+/g, "");
+  if (residue) {
+    return {
+      checked: 0, missing: [], malformed: true, reason: "有裸文字",
+      detail: "「" + residue + "」不是 wikilink。关联列只放链接，说明文字请写在正文里。",
+    };
+  }
   const idx = buildLinkIndex(listFiles(vault));
-  const missing = targets.filter((t) => !idx.targets.has(t.toLowerCase()));
-  return { checked: targets.length, missing: missing, malformed: false };
+  const missing = parsed.targets.filter((t) => !idx.targets.has(t.toLowerCase()));
+  return { checked: parsed.targets.length, missing: missing, malformed: false };
 }
 
 function listFiles(vault) {
@@ -1249,10 +1281,10 @@ function parseReplaceList(spec, flag = "--replace") {
     const to = s.slice(i + 1);
     if (from === "") throw new Error(flag + " 左侧为空：" + JSON.stringify(s));
     if (to === "") throw new Error(flag + " 右侧为空：" + JSON.stringify(s));
-    if (from === to) throw new Error("--replace 两侧相同：" + JSON.stringify(s));
+    if (from === to) throw new Error(flag + " 两侧相同：" + JSON.stringify(s));
     out.push({ from: from, to: to });
   }
-  if (out.length === 0) throw new Error("--replace 为空");
+  if (out.length === 0) throw new Error(flag + " 为空");
   return out;
 }
 
@@ -1340,9 +1372,12 @@ function cmdFixWritten(vault, args) {
         continue;
       }
 
-      // 反向回代必须逐字节回到原文 —— 这是「除了这些对，什么都没动」的硬证据
+      // 反向回代必须逐字节回到原文 —— 这是「除了这些对，什么都没动」的硬证据。
+      // **倒序**撤销：a→b,b→c 这种链式对，正序撤只会得到中间态。
       let back = newBody;
-      for (const h of hits) back = replaceAllText(back, h.to, h.from);
+      for (let i = hits.length - 1; i >= 0; i--) {
+        back = replaceAllText(back, hits[i].to, hits[i].from);
+      }
       if (back !== oldBody) {
         fail(
           "回代校验失败：" + id + "\n  替换不是干净的字面替换（右值在原文中也出现过，会互相干扰）。" +
@@ -1741,7 +1776,8 @@ function main() {
         "  写入（默认 dry-run）:",
         "    --content=<文本> | --content-file=<路径> | --stdin",
         "    --category=<#标签...>     必填，分类列写裸标签，多个用空格分隔",
-        "    --links=<[[a]]、[[b]]>    可选；目标必须在库里真实存在，否则退出 7",
+        "    --allow-new-tag           放行词表外的新标签（D5 闸门：先问用户，点头后才加）",
+        "    --links=<[[a]]、[[b]]>    可选；纯 wikilink 列表（、分隔、禁换行），目标须真实存在；单元格 | 要写 \\|；违规退出 7",
         "    --time=HH:MM              可选，默认当前（也接受 HHmm）",
         "    --date=YYYY-MM-DD         可选，默认今天（用于块 id）",
         "    --write                   落盘；缺省只出 diff",
@@ -1755,6 +1791,7 @@ function main() {
         "  迁移派生层的历史分类（默认 dry-run）:",
         "    --migrate-tags            把索引里裹反引号的分类还原成裸标签",
         "    --map='旧→新'             可逗号分隔多对，用于个别改写（如 life/HomeLab→life）",
+        "    --allow-new-tag           迁移结果含词表外新标签时放行（同上，先问用户）",
         "  自检:",
         "    --verify-ids              校 jc 块的 id 是否仍与正文自洽；不一致退 1",
         "    --write                   把对不上的 id 重算回一致（正文不动）",
@@ -1769,7 +1806,7 @@ function main() {
         "    --classify                对 --content 做标签候选判定，不写盘",
         "  审计:",
         "    --audit --from=YYYY-MM-DD --to=YYYY-MM-DD",
-        "                              列出区间内分类列仍只有占位标签的索引行",
+        "                              列出区间内分类列仍含占位标签（#unsorted）的索引行",
         "  通用:",
         "    --vault=<库名>            默认 $DJ_VAULT，再默认 nextlink",
         "    --registry=<路径>         registry.json 实例；默认按 vault/状态目录探测",
@@ -1953,8 +1990,10 @@ function main() {
     const lc = checkLinks(vault, args.links);
     if (lc.malformed) {
       fail(
-        "--links 必须是 wikilink 形式，例：--links='[[🎁]]、[[🐱]]'" +
-          "\n  （关联列只放真实文件的链接，裸文字会变成无效关联）",
+        "--links 必须是纯 wikilink 列表，例：--links='[[🎁]]、[[🐱]]'" +
+          (lc.reason ? "\n  问题：" + lc.reason : "") +
+          (lc.detail ? "\n  " + lc.detail : "") +
+          "\n  （关联列只放真实文件的链接；裸文字写不进关联，未转义的 | 会把索引行撑成 5 列）",
         7,
       );
     }
@@ -1997,16 +2036,23 @@ function main() {
       after = replaceAllText(after, p.from, p.to);
       applied.push({ from: p.from, to: p.to, n: n });
     }
-    // 反向回代必须逐字节回到原文 —— 与 --fix-written 同一条硬证据
+    // 反向回代必须逐字节回到原文 —— 与 --fix-written 同一条硬证据。
+    // **倒序**撤销：a→b,b→c 这种链式对，正序撤只会得到中间态。
     let back = after;
-    for (const a of applied) back = replaceAllText(back, a.to, a.from);
+    for (let i = applied.length - 1; i >= 0; i--) {
+      back = replaceAllText(back, applied[i].to, applied[i].from);
+    }
     if (back !== before) {
       fail(
         "回代校验失败：--fix-pair 不是干净的字面替换（右值在原文中也出现过，会互相干扰）。" +
           "\n  请换更长的上下文再试，不要用会撞车的对。",
       );
     }
-    pairReport = { applied: applied.map((a) => a.from + "→" + a.to), changed: after !== before };
+    pairReport = {
+      applied: applied.map((a) => ({ from: a.from, to: a.to, n: a.n })),
+      replacements: applied.reduce((s, a) => s + a.n, 0),
+      changed: after !== before,
+    };
     finalContent = after;
   }
 
@@ -2080,7 +2126,10 @@ function main() {
       process.stdout.write("修正: 已套用 " + res.fixReport.replacements + " 处 -> " + res.fixReport.applied.join("、") + "\n");
     }
     if (res.pairReport && res.pairReport.changed) {
-      process.stdout.write("中文修正: 已套用 " + res.pairReport.applied.length + " 处 -> " + res.pairReport.applied.join("、") + "\n");
+      process.stdout.write(
+        "中文修正: 已套用 " + res.pairReport.replacements + " 处 -> " +
+          res.pairReport.applied.map((a) => a.from + "→" + a.to + " ×" + a.n).join("、") + "\n"
+      );
     }
     process.stdout.write("校验: " + JSON.stringify(res.verify) + "\n");
     if (diff) {
