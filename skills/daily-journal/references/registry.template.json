@@ -2,8 +2,9 @@
   "_template": true,
   "_comment": [
     "这是 registry.json 的结构模板，不是可运行的实例。",
-    "真实实例描述具体某个 vault 的笔记结构，由 vault 内的生成器从「分类词表」机械产出：",
-    "  node <vault>/09-Note4LLM/productivity/projects/<项目>/tools/build-registry.mjs \\",
+    "真实实例描述具体某个 vault 的笔记结构，由生成器从「分类词表」机械产出。",
+    "生成器随 skill 分发，不在 vault 里：",
+    "  node <skill>/tools/build-registry.mjs \\",
     "    --vault-root=<vault 绝对路径> --out=<实例落点>",
     "落点优先级：--registry > $DJ_REGISTRY > <vault>/.daily-journal/registry.json",
     "            > <vault>/registry.json > $XDG_STATE_HOME/daily-journal/<vault>.registry.json",
@@ -12,39 +13,9 @@
     ""
   ],
   "version": 1,
-  "generatedFrom": "05-分类词表.md",
-  "domains": [
-    "<域1>",
-    "<域2>",
-    "..."
-  ],
-  "domainPaths": {
-    "<域1>": [
-      "<path-prefix>/",
-      "<另一个-prefix>/"
-    ],
-    "<域2>": [
-      "<path-prefix>/"
-    ]
-  },
-  "catchAll": {
-    "<兜底域>": "<最低优先级的 path-prefix>/"
-  },
-  "whitelistRoots": [
-    "<允许解析锚点的根目录>/",
-    "<...>/"
-  ],
-  "leaves": {
-    "<域1>": [
-      "<叶子1>",
-      "<叶子2>"
-    ],
-    "<域2>": [
-      "<叶子1>"
-    ]
-  },
+  "generatedFrom": "分类词表.md",
   "tagSkeleton": {
-    "_comment": "分类用的多级标签骨架。level1 = §二 的域，level2 = §六 锚点 + §五 叶子。构建时由 tools/build-registry.mjs 机械派生并校验重名。",
+    "_comment": "分类用的多级标签骨架。level1 = §二 的 9 个一级标签，level2 = §六 注册表 + §五 叶子。构建时由 tools/build-registry.mjs 机械派生并校验重名。不建议手改。",
     "level1": [],
     "level2": {},
     "all": [],

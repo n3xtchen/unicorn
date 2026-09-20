@@ -8,7 +8,7 @@ description: Capture text verbatim into today's Obsidian daily journal (02-Done)
 Append what the user gives you **verbatim** into today's daily note in the `nextlink` vault, then attach a classification and links in a separate, rebuildable derived layer.
 
 Read [decision-log.md](references/decision-log.md) before changing this skill or when a write boundary is ambiguous.
-分类是**库内实时标签**：词表 = 文档里维护的一二级骨架 ∪ 限定目录内实有的标签，**不由封闭配置文件决定**（封闭配置会过期）。`registry.json` 由 `05-分类词表.md` 机械派生，现在产两样东西：**标签骨架**（分类用）与**拼写词表**（校对用）。vault/CLI 事实见 [vault-conventions.md](references/vault-conventions.md)。
+分类是**库内实时标签**：词表 = 文档里维护的一二级骨架 ∪ 限定目录内实有的标签，**不由封闭配置文件决定**（封闭配置会过期）。`registry.json` 由 vault 里那份分类词表机械派生，现在产两样东西：**标签骨架**（分类用）与**拼写词表**（校对用）。vault/CLI 事实见 [vault-conventions.md](references/vault-conventions.md)。
 
 ## registry：按 vault 生成，缺失就自动重建
 
@@ -19,7 +19,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 | 情况 | 行为 |
 | --- | --- |
 | 找到实例 | 直接用 |
-| 没找到实例 | 自动在 vault 内找到生成器并重建，然后在 stderr 报告一行 |
+| 没找到实例 | 自动找到生成器并重建，然后在 stderr 报告一行 |
 | `--rebuild-registry` | 无条件重建（词表改完后用这个） |
 | 找不到生成器 / 找到多个 / 生成失败 | 退出码 3 + 原因，**不回退到空词表** |
 
@@ -34,9 +34,12 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
   > <skill>/references/registry.json          ← 旧布局
 ```
 
-生成器不按项目路径硬编码，而是在 vault 内搜 `**/tools/build-registry.mjs`（与「分类词表」同目录，上限 6 层）。它逐条校验锚点路径真实存在，任一不存在即退出 1。vault 根一律向 Obsidian 索取（`app.vault.adapter.basePath`），不自行拼接 iCloud 路径。
+生成器**随 skill 分发**（`<skill>/tools/build-registry.mjs`）—— 它跟脚本同版本、被 git 管着，所以 skill 是自包含的。查找顺序：`$DJ_REGISTRY_GENERATOR` > skill 自带的那份 > vault 内 `**/tools/build-registry.mjs`（上限 6 层，仅作兜底）。
+若 vault 里还留着一份副本，**用 skill 自带的那份**，并在 stderr 提示副本已被忽略 —— 避免两份静默分叉。
 
-**改校对词表或标签骨架**：改 vault 里的 `05-分类词表.md`（唯一权威），然后 `--rebuild-registry`。
+生成器去 vault 里解析分类词表：先 `--taxonomy=<path>`，再看脚本旁边，最后在 `--vault-root` 下搜。文件名口径是 `分类词表.md`（旧名 `05-分类词表.md` 仍兼容，见脚本里的 `TAXONOMY_NAMES`），**整体**要求唯一 —— 新旧各留一份会报「发现多个」而不是随便挑。词表在库里就是一篇普通笔记，位置随意（实测落在 `997-conventions/`）。它逐条校验锚点路径真实存在，任一不存在即退出 1。vault 根一律向 Obsidian 索取（`app.vault.adapter.basePath`），不自行拼接 iCloud 路径。
+
+**改校对词表或标签骨架**：改 vault 里的分类词表（唯一权威，现在在 `997-conventions/分类词表.md` —— 库级基础设施，不属于任何项目目录），然后 `--rebuild-registry`。
 **只用库里已有的标签分类，不需要重建** —— 那部分是实时读的，改了标签立刻生效。
 
 ## Hard rules
@@ -125,7 +128,7 @@ scripts/journal_create.sh            # prints e.g. 02-Done/2026-09-38w-16.md
 
 | 来源 | 内容 | 特点 |
 | --- | --- | --- |
-| 文档骨架 | 一级 9 个 + 二级 83 个 = 92 个 | 在 `05-分类词表.md` 里维护，稳定可评审 |
+| 文档骨架 | 一级 9 个 + 二级 83 个 = 92 个 | 在 vault 的分类词表里维护（现于 `997-conventions/`），稳定可评审 |
 | 实时库标签 | 限定目录内实有的标签 | 从 Obsidian 元数据缓存读，**不用维护、永不陈旧** |
 
 ```bash

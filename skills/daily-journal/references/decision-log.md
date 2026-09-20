@@ -1,7 +1,7 @@
 # 决策记录
 
 改动本 skill、或遇到本文覆盖的边界情况时读这份记录。
-上游权威：`09-Note4LLM/productivity/projects/20260916-daily-journal-skill/04-决策记录.md`（D1–D5）与 `05-分类词表.md`（分类）。
+上游权威：`09-Note4LLM/productivity/projects/20260916-daily-journal-skill/04-决策记录.md`（D1–D16）与 `997-conventions/分类词表.md`（分类，2026-09-18 迁出项目目录）。
 
 ## 硬规则（不可静默放宽）
 
@@ -86,7 +86,7 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 
 ### I5 · 注册表机械生成
 
-`registry.json` 由 `tools/build-registry.mjs` 从 `05-分类词表.md` 解析生成，并在生成时校验：
+`registry.json` 由 `tools/build-registry.mjs` 从 `分类词表.md` 解析生成，并在生成时校验：
 
 - 锚点唯一性；
 - 每条锚点路径真实存在；
@@ -95,7 +95,7 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 - 域路径映射与兜底路径真实存在；
 - §五 每个域都有叶子定义。
 
-因此 `05-分类词表.md` 是唯一权威；`taxonomy.md` 与 `registry.json` 都是派生物。
+因此 `分类词表.md` 是唯一权威；`taxonomy.md` 与 `registry.json` 都是派生物。
 
 → 用途已收窄到**只供校对词表**，分类不再读它。见 T6。
 
@@ -123,7 +123,7 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 
 | 来源 | 内容 | 维护成本 | 何时变 |
 | --- | --- | --- | --- |
-| `05-分类词表.md`（骨架） | 一级 9 + 二级 83 = 92 | 人工评审 | 很少 |
+| `分类词表.md`（骨架） | 一级 9 + 二级 83 = 92 | 人工评审 | 很少 |
 | `app.metadataCache`（实时） | 限定目录内实有的标签 | 零 | 随时 |
 
 所以：**骨架落文档（可评审、不漂移），其余一律实时读（不陈旧）**。`--tags` 把两者合起来输出并分组。
@@ -154,10 +154,10 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 
 ### T6 · `registry.json` 产出「标签骨架 + 校对词表」
 
-`build-registry.mjs` 现在从 `05-分类词表.md` 机械派生两样东西：
+`build-registry.mjs` 现在从 `分类词表.md` 机械派生两样东西：
 
 - `tagSkeleton`：`{level1, level2, all, paths}`——分类用。一级 = §二 的域，二级 = §六 锚点 + §五 叶子。不引入新词。
-- `anchors` / `leaves`：拼写词表与锚点关键词，校对与 `suggestTags` 用。
+- `anchors`：锚点关键词，`--classify` 的「关键词命中」用它，也是校对词表的来源。（§五 叶子的内容通过 `tagSkeleton.all` 进入代码，不再单独输出 `leaves` —— 2026-09-18 删掉死字段。）
 
 生成器新增的校验当场拓到两个**真冲突**：`#life/健康`、`#family/重要日子`（锚点与同域叶子同名，会产出同一个标签）。处理方式是**删叶子、留锚点**（锚点有真实笔记，更具体）。
 锚点的 `path` 不再是合法性前提，只降级成「分类命中时顺手给出的关联列建议链接」。
@@ -313,6 +313,7 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 | 31 | `--migrate-tags` | 通过（11 行，diff 仅分类列；Obsidian metadataCache 确认全部为真标签） |
 | 32 | `--verify-ids` | 通过（报出 3 处不一致并退 1；重算后 14/14 自洽；正文抽提 sha256 前后完全一致） |
 | 33 | 分类词表覆盖核对 | 通过（`life/健康` `work/devops-h` `tool/提效` `family/🐱` `self/me` `work` `family/family` 均在骨架内） |
+| 34 | 生成器自包含 | 通过（把 vault 那份副本藏起来后，skill 自带的那份独立重建成功；两份产物逐字节一致） |
 
 ### 已知实现坑（新增）
 
@@ -322,7 +323,30 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
   `evalInObsidian` 用 `/^=> (.*)$/m` 取结果，遇到多行 JSON 就被截成 `{`。
   所有 payload 必须 `return JSON.stringify(...)`，不能 `return {...}`。
 
+## skill 自包含（2026-09-18）
+
+**问题**：生成器 `build-registry.mjs` 以前只存在于 vault 的项目文档目录里 —— 那是**唯一**一份，而且不在任何 git 仓库中（vault 不是 git 仓库）。但 `journal_apply.mjs` 依赖它重建 registry。也就是说：**skill 在 git 里，skill 的上游工具不在** —— 改了没历史、回不去。
+
+**改法**：生成器搬进 skill（`<skill>/tools/build-registry.mjs`），随仓库分发。
+
+- **优先级**：`$DJ_REGISTRY_GENERATOR` > skill 自带 > vault 内 `**/tools/build-registry.mjs`（仅兜底）。
+- **发现副本就提示**：vault 里若还留着一份，用 skill 自带的，并在 stderr 写明「副本已忽略」。不做静默择一 —— 两份悄悄分叉比只有一份更糟。
+- **词表路径改为解析**：生成器原先把 `分类词表.md` 硬绑在自己旁边（`PROJECT_DIR`）。搬进 skill 后那里没有词表，所以改成三级解析：`--taxonomy` > 脚本旁边 > `--vault-root` 下搜（要求唯一，找到多个就报错而不是随便挑）。
+- **`--out` 默认值修正**：原来是 `HERE/../../../../../../.pi/registry.json`（按旧 `~/.pi/agent/skills/` 布局算出来的），搬走后会算到无关目录；改成 `<vault-root>/.daily-journal/registry.json`。
+- **`--rebuild-registry` 重建完就收工**：以前会继续往下掉进捕获流程，报「缺少内容」并退出 1；现在重建后打印骨架摘要并 `return`（退出 0）。
+
+**验证**：生成器独立跑 → 与线上 `registry.json` 逐字节一致；把 vault 那份藏起来并删掉 registry → skill 那份独立重建成功；把 vault 那份放回来 → 打印忽略提示，产物与上一场景逐字节一致。
+
+**已知取舍**：vault 里那份副本已于 2026-09-18 删除，项目目录下的 `tools/` 整体移除。全局只剩 skill 里这一份，`findGenerators` 的 vault 搜索分支实际上已无对象，但保留着 —— 它仍是有用的兜底（比如把生成器放在别处的用户）。
+
 ## 遗留
+
+- **分类词表已迁出项目目录**（2026-09-18）：现在在 vault 的 `997-conventions/分类词表.md`。它是**库级基础设施**，不随任何项目归档。生成器接受两个文件名（`TAXONOMY_NAMES`）并**整体**要求唯一。
+- **三个「全局化」缺口未开工**（用户定调分类后续用于全局关联 / 对齐 / 复盘 / 维护，与现设计冲突）：
+    - G1 词表读取范围只有 5 个目录（`101-` `102-` 排除，`04-` `08-` 默认不读）。
+    - G2 标签只落在日记派生层，源笔记不动。
+    - G3 `--audit` 只扫日记块，不能做整库对齐复核。
+    - 详见 vault 侧 `03-实现清单.md` 的待办节与 `04-决策记录.md` D16。G1 是前置。
 
 - `05-personal/{🐱,🐷,🎁,小雷}` 注册项暂无 aliases（用户未提供别称）。提供后补进上游 §六。
 - 合并 `productivity/docker.md`、`productivity/mermaid.md` 时的源文件被移到 `<vault>/.trash/`，等用户确认后可清空。

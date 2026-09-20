@@ -196,7 +196,7 @@ const WRITE_PAYLOAD = String.raw`
   const iEnd = tail.findIndex(function (l) { return idxEndRe.test(l); });
 
   // 分类列写成**裸标签**（不裹反引号），这样 Obsidian 才会把它当标签。
-  // 原文锚点仍是不可读的 opaque id，继续裹反引号。
+  // 块 id 仍是不可读的 opaque id，继续裹反引号。
   const linkCell = P.links && P.links.length > 0 ? P.links : "\u2014";
   const row = "| " + P.time + " | " + BT + P.id + BT + " | " + P.category + " | " + linkCell + " |";
 
@@ -208,7 +208,7 @@ const WRITE_PAYLOAD = String.raw`
       "## " + P.sections.derived,
       "",
       "<!-- jc:index:begin -->",
-      "| 时间 | 原文锚点 | 分类 | 关联 |",
+      "| 时间 | 块 id | 分类 | 关联 |",
       "|---|---|---|---|",
       row,
       "<!-- jc:index:end -->",
@@ -785,7 +785,8 @@ function vaultRoot(vault, opts = {}) {
   }
 }
 
-// \u751f\u6210\u5668\u4e0e\u300c\u5206\u7c7b\u8bcd\u8868\u300d\u540c\u76ee\u5f55\uff0c\u4e0d\u786c\u7f16\u7801\u9879\u76ee\u8def\u5f84\uff08\u5b83\u5e26\u65e5\u671f\u524d\u7f00\uff09\u3002
+// 生成器优先用 skill 自带的那份（<skill>/tools/build-registry.mjs）—— 它跟脚本同版本、被 git 管着。
+// vault 里可能还留着一份旧副本，仅作兜底，并且会提示你它被忽略了。
 const SKIP_DIRS = new Set([".git", ".obsidian", ".trash", ".daily-journal", "node_modules"]);
 
 function findGenerators(root) {
@@ -810,32 +811,52 @@ function findGenerators(root) {
   return hits;
 }
 
+function findGenerator(root) {
+  const env = process.env.DJ_REGISTRY_GENERATOR;
+  if (env) {
+    if (!fs.existsSync(env)) fail("$DJ_REGISTRY_GENERATOR 指向的生成器不存在：" + env, 3);
+    return env;
+  }
+
+  const local = path.join(HERE, "..", "tools", "build-registry.mjs");
+  const localExists = fs.existsSync(local);
+  const inVault = findGenerators(root);
+
+  if (localExists) {
+    if (inVault.length > 0) {
+      process.stderr.write(
+        "daily-journal: 提示 vault 内还有 " + inVault.length + " 份生成器副本，已忽略（用的是 skill 自带的）：\n" +
+          inVault.map((g) => "  - " + g).join("\n") +
+          "\n"
+      );
+    }
+    return local;
+  }
+
+  if (inVault.length === 1) return inVault[0];
+  if (inVault.length > 1) {
+    fail(
+      [
+        "registry.json 不存在，且 vault 内发现多个生成器，无法确定用哪个：",
+        ...inVault.map((g) => "  - " + g),
+      ].join("\n"),
+      3
+    );
+  }
+  fail(
+    [
+      "registry.json 不存在，且找不到生成器 build-registry.mjs。",
+      "  找过 skill 自带位置：" + local,
+      "  也找过 vault：" + root,
+    ].join("\n"),
+    3
+  );
+}
+
 function rebuildRegistry(vault) {
   const root = vaultRoot(vault);
   const target = path.join(root, ".daily-journal", "registry.json");
-  const generators = findGenerators(root);
-
-  if (generators.length === 0) {
-    fail(
-      [
-        "registry.json \u4e0d\u5b58\u5728\uff0c\u4e14 vault \u5185\u627e\u4e0d\u5230\u751f\u6210\u5668 tools/build-registry.mjs\u3002",
-        "  \u751f\u6210\u5668\u5e94\u4e0e\u300c\u5206\u7c7b\u8bcd\u8868\u300d\u540c\u76ee\u5f55\uff1a<vault>/**/tools/build-registry.mjs",
-        "  \u5df2\u67e5\u627e\uff1a" + root,
-      ].join("\n"),
-      3
-    );
-  }
-  if (generators.length > 1) {
-    fail(
-      [
-        "registry.json \u4e0d\u5b58\u5728\uff0c\u4e14 vault \u5185\u53d1\u73b0\u591a\u4e2a\u751f\u6210\u5668\uff0c\u65e0\u6cd5\u786e\u5b9a\u7528\u54ea\u4e2a\uff1a",
-        ...generators.map((g) => "  - " + g),
-      ].join("\n"),
-      3
-    );
-  }
-
-  const generator = generators[0];
+  const generator = findGenerator(root);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   try {
     execFileSync(process.execPath, [generator, "--vault-root=" + root, "--out=" + target], {
@@ -914,7 +935,7 @@ function tagRoots(args) {
 }
 
 // 词表 = 「文档里维护的一二级骨架」 ∪ 「限定目录内实有的库标签」。
-// 前者稳定、可审阅（来自 05-分类词表.md 的机械派生），后者实时、不用维护。
+// 前者稳定、可审阅（来自 vault 里那份分类词表的机械派生），后者实时、不用维护。
 function loadTags(vault, args) {
   const roots = tagRoots(args);
   const registry = loadRegistry(vault, args);
@@ -1392,7 +1413,7 @@ const MIGRATE_LIST_PAYLOAD = String.raw`
 
 const BT_CHAR = String.fromCharCode(96);
 
-// 索引行 = "| 时间 | 锚点 | 分类 | 关联 |"
+// 索引行 = "| 时间 | 块 id | 分类 | 关联 |"
 function splitIndexRow(line) {
   if (line.charAt(0) !== "|" || line.charAt(line.length - 1) !== "|") return null;
   const parts = line.slice(1, -1).split("|").map((s) => s.trim());
@@ -1635,9 +1656,18 @@ function main() {
   CLI_ARGS = args;
   const vault = typeof args.vault === "string" ? args.vault : DEFAULT_VAULT;
 
-  // registry 是派生物，缺失时自建；显式要求重建时无条件重建。
+  // registry 是派生物，缺失时自建；显式要求重建时无条件重建，然后收工。
   if (args["rebuild-registry"]) {
     rebuildRegistry(vault);
+    const reg = readRegistry(vault, args) || {};
+    const sk = reg.tagSkeleton || {};
+    const l1 = (sk.level1 || []).length;
+    const all = (sk.all || []).length;
+    process.stdout.write(
+      "registry 已重建 ✅  一级 " + l1 + " + 二级 " + (all - l1) + " = " + all +
+        " 个标签；锚点 " + (reg.anchors || []).length + " 条\n"
+    );
+    return;
   }
 
   if (args.help || args.h) {
