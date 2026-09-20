@@ -1,6 +1,6 @@
 ---
 name: markdown-conventions
-description: 按用户既有的 markdownlint-cli2 配置写、改 Markdown 与 Obsidian 笔记，并在落笔后自检到 0 报错。覆盖标题层级、表格对齐、围栏语言、列表缩进、裸链接、内联 HTML、frontmatter、wikilink 与 mermaid 渲染校验。用户要求写或改 .md 文件、整理笔记、生成文档，或修 markdownlint 报错时使用。
+description: 按用户既有的 markdownlint-cli2 配置写、改 Markdown 与 Obsidian 笔记，并在落笔后自检到 0 报错。覆盖标题层级、表格对齐、围栏语言、列表缩进、裸链接、内联 HTML、frontmatter、代码位置引用、wikilink 与 mermaid 渲染校验。用户要求写或改 .md 文件、整理笔记、生成文档，或修 markdownlint 报错时使用。
 ---
 
 # Markdown 规范：落笔就照做 + 落笔后自检
@@ -22,7 +22,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 
 `MD013`（行长度）和 `MD012`（连续空行）已关闭，**不要**为了 80 列去拆行。其余规则全部默认开启。
 
-## 落笔就照做的 9 条
+## 落笔就照做的 10 条
 
 1. **表格不要手对齐。** 单元格一律写成 `| a | b |`（单空格），别用空格把竖线怼齐。手对齐的表格在后续编辑单元格时会与表头/分隔行错位，直接触发 MD060。
 2. **标题层级不跳级**，且**结尾不带标点**。实测 `.` `,` `;` `:` `!` `。` `，` `；` `：` `！` 都会报 MD026（半角 `?` 例外，但不建议依赖）。
@@ -33,6 +33,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 7. **标题前后（MD022）、围栏前后（MD031）都要留空行。**
 8. **不要裸写 URL**，包成 `<https://...>` 或 `[文字](url)`（MD034）。**不要内联 HTML**，含表格里的 `<br>`（MD033）。
 9. **一个标题只写一处**：frontmatter 的 `title:` 与正文 H1 不能同时存在（MD025；MD041 也认 frontmatter title）。默认保留 frontmatter `title`、不写 H1，详见 decision-log。
+10. **引用本仓库代码位置用符号名，不写裸行号。** 写标识符、函数名、CLI 参数或条款名（`PLACEHOLDER_TAG`、`args["allow-new-tag"]`），不要只写 `:946` / `:1943`——代码一改，行号就漂移。确需行号时与符号名并列。vault 笔记里引用外部材料的 S 编号仍按下面体例带行号，两者不冲突。
 
 ## 落笔后自检（必做）
 
