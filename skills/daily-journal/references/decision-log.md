@@ -452,7 +452,7 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 - **R8 · `pairReport` 丢了命中数。** 只报「替换了什么」，不报「各几次」，用户没法核。现在保留
   每对的 `n` 并新增 `replacements`（总处数），与 `fixReport.replacements` 同口径。
 - **R9 · `--map` 报错冒名 `--replace`。** `parseReplaceList()` 的旗标名写死在函数里，
-  迁移路径复用时报错就署错名。改成参数化 `flag`（默认 `--replace`，`:1270`）。
+  迁移路径复用时报错就署错名。改成参数化 `flag`（默认 `--replace`，`:1309`）。
 
 | # | 验收项 | 结果 |
 | --- | --- | --- |
@@ -461,6 +461,42 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 | 46 | 反向回代倒序 | 通过（`a→b,b→c`、`便宜→漂移,漂移→偏移` 均通过；`--fix-written` 链式 `邱灵→邱林→QiuLin` 干跑通过；右值撞原文的 `便宜→漂移` 仍被拒） |
 | 47 | `pairReport` 命中数 | 通过（`系统出→系统里` ×3 → `已套用 3 处 -> 系统出→系统里 ×3`） |
 | 48 | `--map` 报错署名 | 通过（`--map='a→a'` 报「--map 两侧相同」） |
+
+## 八处代码缺陷修复（2026-09-20）
+
+同一批审查里剩下的实现缺陷。前四处是「静默失效 / 误报」，后四处是「没说清 / 没拦住」。
+
+- **A1 · `obsidian()` 没有超时，会永久挂死。** `execFileSync` 不设 `timeout`，Obsidian CLI 偶发无响应
+  （实测 `--tags` 约 1/60~1/138 概率卡住）就把整个脚本挂住。加 `timeout` + `killSignal: SIGKILL`，
+  超时杀子进程、退出 4，并提示重跑；阈值可用 `DJ_TIMEOUT_MS` 覆盖（默认 30000）。**这只是止损**：
+  Obsidian 为什么偶发无响应仍未查清，超时把「挂死」降级成「可重试的失败」。
+- **A2 · `--audit` 白读 registry。** 审计分支 `loadRegistry()` 读了却全程没用，白付多次 `eval`
+  往返，且 registry 损坏会连带 audit 失败。删掉。
+- **A3 · 捕获路径没有并发守卫。** `--fix-written` 早已在读-写之间比对字节，capture 却是
+  `app.vault.process(() => after)` 直接覆盖。改成同一个口径：`process` 回调里比对
+  `data !== before`，不一致就原样返回、报 `concurrent-edit`、不落盘。
+- **A4 · `highlight-unclosed` 把代码里的 `==` 算进去。** `content.match(/==/g)` 是全量计数，
+  python 围栏里的 `if a == b:` 会凑成奇数而误报。改为复用 `codeRanges()`，跳过围栏与行内代码里的 `==`。
+- **A5 · dry-run 会顺手创建当日笔记。** 无 `--path` 时一律走 `ensureDaily()`（= `daily:read` + `daily:path`），
+  而 `daily:read` 会把不存在的当日笔记建出来，与 D3「dry-run 不落盘」相抵。改为：只有 `--write` 才
+  `ensureDaily()`，dry-run 只取 `daily:path`，缺文件由 payload 报 `note-not-found`。
+- **A6 · `--scope` 前缀泄漏。** 用 `indexOf(root) === 0` 判目录，`--scope='02-Don'` 会命中 `02-Done`
+  （实测漏进 14 个标签）。改成先剥尾斜杠，再要求整段相等或 `root + "/"` 前缀。
+- **A7 · `--fix` 指定不存在的项会静默 no-op。** `--fix=bogus` 不改任何东西也不出声。现在显式列出的
+  id 只要有一个没落到 `applied`（不存在，或该项 `autoFix: false`）就退出 1；`safe` / `all` 不受影响。
+- **A8 · `--help` 也要 Obsidian。** `preflight()` 在 `main()` 之前无条件执行，于是
+  `DJ_OBSIDIAN_BIN=nope --help` 直接退 127。改为在 `main()` 里、取到 args 之后、且非 `--help` 时才 preflight。
+
+| # | 验收项 | 结果 |
+| --- | --- | --- |
+| 49 | `obsidian()` 超时 | 通过（假 CLI `sleep 30` + `DJ_TIMEOUT_MS=1000` → 1.09s 杀掉，退 4） |
+| 50 | `--audit` 不读 registry | 通过（`--registry` 指向损坏 JSON 仍 `ok:true`） |
+| 51 | 捕获并发守卫 | 通过（mock vault：正常 → `written`；期间被改 → `concurrent-edit` 不落盘） |
+| 52 | 高亮不计代码 | 通过（python 围栏 `if a == b` + 行内 code → 0 findings；真未闭合仍报） |
+| 53 | dry-run 不建笔记 | 通过（假 CLI 记录调用：dry-run 0 次 `daily:read`，`--write` 1 次） |
+| 54 | `--scope` 前缀 | 通过（`02-Don` 库内实有 0（原 14）；`02-Done` / `02-Done/` 均 15） |
+| 55 | `--fix` 无效 id | 通过（`--fix=bogus` 退 1；`autoFix:false` 的 id 也退 1；合法 id 照常套用） |
+| 56 | `--help` 免 Obsidian | 通过（`DJ_OBSIDIAN_BIN=nope --help` 正常打印、退 0；`--tags` 仍报找不到 CLI） |
 
 ## 遗留
 

@@ -31,6 +31,11 @@ const OBSIDIAN_BIN = process.env.DJ_OBSIDIAN_BIN || "obsidian";
 const OBSIDIAN_PROC_RE = process.env.DJ_OBSIDIAN_PROC_RE || "MacOS/Obsidian$";
 // 本机特定的配置一律走环境变量，不写死在逻辑里。
 const DEFAULT_VAULT = process.env.DJ_VAULT || "nextlink";
+// obsidian CLI 偶发无响应，挂住的子进程会让本脚本永久等待；超时即杀掉并退出 4。
+const OBSIDIAN_TIMEOUT_MS = (() => {
+  const n = Number(process.env.DJ_TIMEOUT_MS || 30000);
+  return Number.isFinite(n) && n > 0 ? n : 30000;
+})();
 
 // parseArgs 的结果在 main 里落到这里，供不接 args 的调用点（如 runProofread）取用。
 let CLI_ARGS = {};
@@ -95,10 +100,26 @@ function preflight() {
 }
 
 function obsidian(vault, args) {
-  return execFileSync(OBSIDIAN_BIN, ["vault=" + vault, ...args], {
-    encoding: "utf8",
-    maxBuffer: 256 * 1024 * 1024,
-  });
+  try {
+    return execFileSync(OBSIDIAN_BIN, ["vault=" + vault, ...args], {
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: OBSIDIAN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+  } catch (e) {
+    const timedOut =
+      e && (e.code === "ETIMEDOUT" || e.signal === "SIGKILL" || (e.killed && e.status === null));
+    if (timedOut) {
+      fail(
+        "obsidian CLI 超过 " + OBSIDIAN_TIMEOUT_MS + "ms 无响应（子进程已杀）：obsidian vault=" +
+          vault + " " + args.join(" ").slice(0, 200) +
+          "\n  这是 Obsidian 侧偶发无响应，重跑通常即可；重复出现请重启 Obsidian（可用 DJ_TIMEOUT_MS 调阈值）。",
+        4
+      );
+    }
+    throw e;
+  }
 }
 
 function evalInObsidian(vault, code) {
@@ -255,7 +276,18 @@ const WRITE_PAYLOAD = String.raw`
     return JSON.stringify(base);
   }
 
-  await app.vault.process(file, function () { return after; });
+  // 乐观并发：读取到写入之间若 Obsidian 那边改过，就原样返回、不落盘。
+  let concurrent = false;
+  await app.vault.process(file, function (data) {
+    if (data !== before) { concurrent = true; return data; }
+    return after;
+  });
+  if (concurrent) {
+    base.ok = false;
+    base.status = "concurrent-edit";
+    base.error = "concurrent-edit";
+    return JSON.stringify(base);
+  }
   const readBack = await app.vault.read(file);
   const readBackExact = readBack === after;
   base.status = readBackExact ? "written" : "readback-mismatch";
@@ -307,7 +339,8 @@ const TAGS_PAYLOAD = String.raw`
     const f = files[i];
     let ok = false;
     for (let r = 0; r < roots.length; r++) {
-      if (f.path.indexOf(roots[r]) === 0) { ok = true; break; }
+      const root = roots[r].replace(/\/+$/, "");
+      if (f.path === root || f.path.indexOf(root + "/") === 0) { ok = true; break; }
     }
     if (!ok) continue;
     let c = null;
@@ -644,8 +677,14 @@ function proofread(content, vocab, linkIndex, skipKinds) {
     }
   }
 
-  // 5. == 高亮
-  const hl = (content.match(/==/g) || []).length;
+  // 5. == 高亮（代码围栏与行内代码里的 == 不算，「if a == b」不是高亮）
+  let hl = 0;
+  const eqRe = /==/g;
+  let em;
+  while ((em = eqRe.exec(content))) {
+    if (inRanges(ranges, em.index)) continue;
+    hl += 1;
+  }
   if (hl % 2 !== 0) {
     findings.push({ kind: "highlight-unclosed", severity: "medium", autoFix: false, found: "==", suggestion: "补一个 ==", reason: "== 高亮标记出现 " + hl + " 次（奇数），有未闭合的高亮。" });
   }
@@ -1752,6 +1791,8 @@ function cmdVerifyIds(vault, args) {
 function main() {
   const args = parseArgs(process.argv.slice(2));
   CLI_ARGS = args;
+  // --help 不需要 Obsidian；其余路径先做 preflight。
+  if (!(args.help || args.h)) preflight();
   const vault = typeof args.vault === "string" ? args.vault : DEFAULT_VAULT;
 
   // registry 是派生物，缺失时自建；显式要求重建时无条件重建，然后收工。
@@ -1813,6 +1854,9 @@ function main() {
         "    --rebuild-registry        重新生成 registry（缺失时也会自动重建）",
         "    --path=<库内相对路径>     默认由 daily:path 得到",
         "    --json                    以 JSON 输出",
+        "  环境变量:",
+        "    DJ_VAULT / DJ_OBSIDIAN_BIN / DJ_OBSIDIAN_PROC_RE",
+        "    DJ_TIMEOUT_MS             obsidian CLI 超时毫秒，默认 30000，超时退出 4",
         "",
       ].join("\n")
     );
@@ -1836,7 +1880,6 @@ function main() {
   }
 
   if (args.audit) {
-    const registry = loadRegistry(vault, args);
     const p = localParts();
     const from = typeof args.from === "string" ? args.from : p.date;
     const to = typeof args.to === "string" ? args.to : from;
@@ -2060,10 +2103,23 @@ function main() {
   if (typeof args.fix === "string") {
     const pf = runProofread(vault, finalContent, skipSet(args));
     let ids;
+    let explicit = null;
     if (args.fix === "safe") ids = safeIds(pf.findings);
     else if (args.fix === "all") ids = "all";
-    else ids = args.fix.split(",").map((s) => s.trim()).filter(Boolean);
+    else {
+      explicit = args.fix.split(",").map((s) => s.trim()).filter(Boolean);
+      ids = explicit;
+    }
     const r = applyFixes(finalContent, pf.findings, ids);
+    if (explicit) {
+      const miss = explicit.filter((id) => !r.applied.includes(id));
+      if (miss.length > 0) {
+        fail(
+          "--fix 指定的项不存在或不可机械修正：" + miss.join(",") + "\n  可用 id 见 --proofread 的输出。",
+          1
+        );
+      }
+    }
     const byId = new Map(pf.findings.map((f) => [f.id, f]));
     fixReport = {
       requested: args.fix,
@@ -2083,7 +2139,9 @@ function main() {
   const hash = crypto.createHash("sha1").update(finalContent, "utf8").digest("hex").slice(0, 4);
   const id = idBase + "-" + hash;
 
-  const rel = typeof args.path === "string" ? args.path : ensureDaily(vault);
+  // dry-run 不落盘，也就不该创建当日笔记：只取路径，缺文件由 payload 报 note-not-found。
+  const rel =
+    typeof args.path === "string" ? args.path : args.write ? ensureDaily(vault) : dailyPath(vault);
   const payload = {
     path: rel,
     content: finalContent,
@@ -2103,6 +2161,12 @@ function main() {
 
   if (!res.ok && res.status !== "duplicate") {
     process.stderr.write(JSON.stringify(res, null, 2) + "\n");
+    if (res.error === "concurrent-edit") {
+      process.stderr.write("daily-journal: 读取到写入之间 Obsidian 里改过这条笔记，已放弃落盘；请重跑。\n");
+    }
+    if (res.error === "note-not-found" && !args.write) {
+      process.stderr.write("daily-journal: 当日笔记还不存在；dry-run 不建文件，加 --write 才会建。\n");
+    }
     process.exit(res.error === "id-collision" ? 5 : 6);
   }
 
@@ -2150,5 +2214,4 @@ function parseTime(v) {
   return { compact: pad2(h) + pad2(mi), display: pad2(h) + ":" + pad2(mi) };
 }
 
-preflight();
 main();
