@@ -3,7 +3,7 @@
 //
 // 三种模式：
 //   --classify            只做分类判定，不写盘
-//   --audit               扫描日期区间内所有 unsorted/- 条目
+//   --audit               扫描日期区间内分类仍是占位标签（#unsorted）的条目
 //   (默认)                追加一条捕获：dry-run 出 diff，--write 才落盘
 //
 // 写入一律通过 `obsidian eval` 在 Obsidian 进程内用 app.vault.process() 完成，
@@ -235,7 +235,7 @@ const WRITE_PAYLOAD = String.raw`
     marksBalanced: vBegin === vEnd,
     oneBlockAdded: vBegin === blocks.length + 1,
     hasNewBlock: after.indexOf("<!-- jc:begin id=" + P.id + " -->") >= 0,
-    bodyExact: after.indexOf(P.content) >= 0,
+    bodyExact: P.content.length > 0 && after.indexOf(P.content) >= 0,
     originalsPreserved: originalsPreserved
   };
   verify.allOk = verify.marksBalanced && verify.oneBlockAdded && verify.hasNewBlock && verify.bodyExact && verify.originalsPreserved;
@@ -354,7 +354,10 @@ const AUDIT_PAYLOAD = String.raw`
     const text = await app.vault.read(f);
     const lines = text.split(NL);
     for (let j = 0; j < lines.length; j++) {
-      if (lines[j].indexOf("unsorted/-") < 0) continue;
+      const cells = lines[j].split("|");
+      if (cells.length < 5) continue;
+      const tags = cells[3].split(/\s+/).filter(function (s) { return s.length > 0; });
+      if (tags.indexOf(P.tag) < 0) continue;
       rows.push({ date: day, path: f.path, line: j + 1, row: lines[j] });
     }
   }
@@ -562,51 +565,74 @@ function proofread(content, vocab, linkIndex, skipKinds) {
   for (const t of vocab.keys()) lower.set(t.toLowerCase(), t);
   const asciiTerms = [...vocab.keys()].filter((t) => /^[\x00-\x7F]+$/.test(t));
   let m;
-  const seenAscii = new Set();
+  // 同一个词只出一条 finding（不重复刷屏），但 finding 记下它**全部**出现的 span：
+  // 同一词的每一处都要被改掉，与 --fix-pair 的全量替换同一口径（R4）。
+  const asciiSeen = new Map();
   while ((m = wordRe.exec(content))) {
     const w = m[0];
     if (inRanges(skipRanges, m.index)) continue;
     if (vocab.has(w)) continue;
-    if (seenAscii.has(w)) continue;
 
     const canonical = lower.get(w.toLowerCase());
+    let kind = null;
+    let repl = null;
+    let reason = null;
     if (canonical && canonical !== w) {
-      seenAscii.add(w);
-      findings.push({ kind: "ascii-case", severity: "low", autoFix: true, start: m.index, end: m.index + w.length, replace: canonical, found: w, suggestion: canonical, reason: "词表中的规范写法是 " + canonical + "。" });
-      continue;
-    }
-    if (canonical) continue;
-    if (ASCII_STOPWORDS.has(w.toLowerCase())) continue;
-    if (w.length < 5) continue;
-
-    // 实测：拿 155 个注册表词做「编辑距离近似」，在真语料上约一半是误报
-    // （none->done、gate->date、rate->date、best->Bert、team->term）——
-    // 因为这些领域词本身就是常见英文词。只保留两类真正可靠的：
-    //   len >= 7 的长词，允许距离 2
-    //   len 5-6 的短词，只允许「单次相邻换位」
-    // 真阳性（obsidan->obsidian、iceborg->iceberg、sprak->spark）全落在其中。
-    const lw = w.toLowerCase();
-    const short = w.length <= 6;
-    const max = short ? 1 : 2;
-    let best = null;
-    for (const t of asciiTerms) {
-      if (Math.abs(t.length - w.length) > max) continue;
-      const lt = t.toLowerCase();
-      if (short && !isTranspositionOnly(lw, lt)) continue;
-      const d = damerau(lw, lt, max);
-      if (d < 1 || d > max) continue;
-      if (!best || d < best.d || (d === best.d && Math.abs(t.length - w.length) < Math.abs(best.t.length - w.length))) {
-        best = { t: t, d: d };
+      kind = "ascii-case";
+      repl = canonical;
+      reason = "词表中的规范写法是 " + canonical + "。";
+    } else if (!canonical && !ASCII_STOPWORDS.has(w.toLowerCase()) && w.length >= 5) {
+      // 实测：拿 155 个注册表词做「编辑距离近似」，在真语料上约一半是误报
+      // （none->done、gate->date、rate->date、best->Bert、team->term）——
+      // 因为这些领域词本身就是常见英文词。只保留两类真正可靠的：
+      //   len >= 7 的长词，允许距离 2
+      //   len 5-6 的短词，只允许「单次相邻换位」
+      // 真阳性（obsidan->obsidian、iceborg->iceberg、sprak->spark）全落在其中。
+      const lw = w.toLowerCase();
+      const short = w.length <= 6;
+      const max = short ? 1 : 2;
+      let best = null;
+      for (const t of asciiTerms) {
+        if (Math.abs(t.length - w.length) > max) continue;
+        const lt = t.toLowerCase();
+        if (short && !isTranspositionOnly(lw, lt)) continue;
+        const d = damerau(lw, lt, max);
+        if (d < 1 || d > max) continue;
+        if (!best || d < best.d || (d === best.d && Math.abs(t.length - w.length) < Math.abs(best.t.length - w.length))) {
+          best = { t: t, d: d };
+        }
+      }
+      if (best) {
+        kind = "ascii-typo";
+        repl = best.t;
+        reason = "与本库词表「" + best.t + "」相差 " + best.d + " 个字符，疑似拼写错误。";
       }
     }
-    if (best) {
-      seenAscii.add(w);
-      findings.push({ kind: "ascii-typo", severity: "medium", autoFix: true, start: m.index, end: m.index + w.length, replace: best.t, found: w, suggestion: best.t, reason: "与本库词表「" + best.t + "」相差 " + best.d + " 个字符，疑似拼写错误。" });
+    if (!kind) continue;
+
+    const span = { start: m.index, end: m.index + w.length };
+    const prev = asciiSeen.get(w);
+    if (prev) {
+      prev.spans.push(span);
+      continue;
     }
+    const finding = {
+      kind: kind,
+      severity: kind === "ascii-typo" ? "medium" : "low",
+      autoFix: true,
+      start: span.start,
+      end: span.end,
+      spans: [span],
+      replace: repl,
+      found: w,
+      suggestion: repl,
+      reason: reason,
+    };
+    findings.push(finding);
+    asciiSeen.set(w, finding);
   }
 
   // 3. 相邻重复虚词
-  // 4. 相邻重复虚词
   for (const rw of REPEAT_WORDS) {
     let from = 0;
     while (true) {
@@ -697,14 +723,21 @@ function safeIds(findings) {
 
 function applyFixes(content, findings, ids) {
   const chosen = findings.filter((f) => f.autoFix && f.start !== undefined && f.end !== undefined && (ids === "all" || (Array.isArray(ids) && ids.includes(f.id))));
-  const sorted = chosen.slice().sort((a, b) => b.start - a.start);
+  // 一条 finding 可能对应多处出现（R4：同一个词全改），先展平成 span 再统一按位置**倒序**替换 ——
+  // 倒序保证前面的偏移不会被后面改动推移。
+  const spans = [];
+  for (const f of chosen) {
+    const list = Array.isArray(f.spans) && f.spans.length > 0 ? f.spans : [{ start: f.start, end: f.end }];
+    for (const s of list) spans.push({ start: s.start, end: s.end, replace: f.replace || "", id: f.id });
+  }
+  spans.sort((a, b) => b.start - a.start);
   let out = content;
   const applied = [];
-  for (const f of sorted) {
-    out = out.slice(0, f.start) + (f.replace || "") + out.slice(f.end);
-    applied.push(f.id);
+  for (const s of spans) {
+    out = out.slice(0, s.start) + s.replace + out.slice(s.end);
+    if (!applied.includes(s.id)) applied.push(s.id);
   }
-  return { text: out, applied: applied.reverse() };
+  return { text: out, applied: applied.reverse(), replacements: spans.length };
 }
 
 function unifiedDiff(a, b) {
@@ -1511,7 +1544,7 @@ function cmdMigrateTags(vault, args) {
       const tags = mapped.map((t) => "#" + t);
       const check = validateTags(tags.join(" "), known);
       if (!check.ok) fail("迁移后不合法：" + f.path + " 第 " + (i + 1) + " 行 " + JSON.stringify(tags.join(" ")) + "\n  " + check.reason);
-      if (check.novel && check.novel.length > 0) {
+      if (check.novel && check.novel.length > 0 && !args["allow-new-tag"]) {
         fail(
           "迁移后出现词表外的新标签（D5：必须先问用户）：" + check.novel.join("、") + "\n" + "  在 " + f.path + " 第 " + (i + 1) + " 行。若已确认，用 --map='旧→新' 指定，或加 --allow-new-tag。",
         );
@@ -1736,6 +1769,7 @@ function main() {
         "    --classify                对 --content 做标签候选判定，不写盘",
         "  审计:",
         "    --audit --from=YYYY-MM-DD --to=YYYY-MM-DD",
+        "                              列出区间内分类列仍只有占位标签的索引行",
         "  通用:",
         "    --vault=<库名>            默认 $DJ_VAULT，再默认 nextlink",
         "    --registry=<路径>         registry.json 实例；默认按 vault/状态目录探测",
@@ -1772,7 +1806,7 @@ function main() {
     const folder = typeof args.path === "string" ? path.dirname(args.path) : path.dirname(dailyPath(vault));
     const code =
       "globalThis.__DJ_P = " +
-      JSON.stringify({ from, to, folder, nameRe: "^(\\d{4})-(\\d{2})-\\d{2}w-(\\d{2})$" }) +
+      JSON.stringify({ from, to, folder, tag: PLACEHOLDER_TAG, nameRe: "^(\\d{4})-(\\d{2})-\\d{2}w-(\\d{2})$" }) +
       ";\n" +
       AUDIT_PAYLOAD;
     const res = evalInObsidian(vault, code);
@@ -1874,7 +1908,7 @@ function main() {
         const auto = f.autoFix ? (SAFE_KINDS.has(f.kind) ? "[建议直改]" : "[需确认]") : "[只能手改]";
         process.stdout.write(
           "  " + f.id + "  " + f.severity.padEnd(6) + auto + "  " + f.kind + "\n" +
-            "       发现: " + f.found + "\n" +
+            "       发现: " + f.found + (Array.isArray(f.spans) && f.spans.length > 1 ? "（" + f.spans.length + " 处）" : "") + "\n" +
             "       建议: " + (f.suggestion === "" ? "(删除)" : f.suggestion) + "\n" +
             "       理由: " + f.reason + "\n\n"
         );
@@ -1885,6 +1919,11 @@ function main() {
 
   // 写入模式
   if (content === null) fail("缺少内容：请给 --content / --content-file / --stdin");
+  // 空内容不是一条捕获：writer 那边 bodyExact 用 indexOf，空串恒命中，
+  // 会让空块混过五项校验。这里先拦，payload 里再兜一层（同一口径：empty 是 blocking）。
+  if (content.trim() === "") {
+    fail("内容为空或只有空白，没有可写入的原文。\n  （校对里 empty 是 blocking 项，写入侧同一口径：不落盘）");
+  }
   if (typeof args.category !== "string" || args.category.length === 0) {
     fail("缺少 --category=<#标签...>（分类列写裸标签，可多个）");
   }
@@ -1984,6 +2023,7 @@ function main() {
       requested: args.fix,
       applied: r.applied.map((id) => (byId.get(id) || {}).found).filter(Boolean),
       appliedIds: r.applied,
+      replacements: r.replacements,
       changed: r.text !== finalContent,
     };
     finalContent = r.text;
@@ -2037,7 +2077,7 @@ function main() {
     process.stdout.write("目标: " + res.path + "\n");
     process.stdout.write("状态: " + res.status + "  id: " + res.id + "  分类: " + res.category + "\n");
     if (res.fixReport && res.fixReport.changed) {
-      process.stdout.write("修正: 已套用 " + res.fixReport.applied.length + " 处 -> " + res.fixReport.applied.join("、") + "\n");
+      process.stdout.write("修正: 已套用 " + res.fixReport.replacements + " 处 -> " + res.fixReport.applied.join("、") + "\n");
     }
     if (res.pairReport && res.pairReport.changed) {
       process.stdout.write("中文修正: 已套用 " + res.pairReport.applied.length + " 处 -> " + res.pairReport.applied.join("、") + "\n");
