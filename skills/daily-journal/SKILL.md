@@ -1,6 +1,6 @@
 ---
 name: daily-journal
-description: Capture text verbatim into today's Obsidian daily journal (02-Done), then classify and link it in an agent-maintained derived layer. Use when the user asks to 记一下、记录一下、追加到今天的日记、capture/journal this, or hands over a thought to be kept for today.
+description: Capture text verbatim into today's Obsidian daily journal (02-Done), then classify and link it in an agent-maintained derived layer; also captures tasks into a separate mutable 今日待办 layer, and can propose todo candidates spotted inside a thought for the user to confirm. Use when the user asks to 记一下、记录一下、追加到今天的日记、capture/journal this, hands over a thought to be kept for today, asks to 记个待办、加个任务、提醒我做某事（task/todo capture）, or asks to 把待办挑出来、这段里有没有待办、提取待办（todo extraction）.
 ---
 
 # Daily Journal Capture
@@ -46,6 +46,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 
 1. **原文不得擅自改写（R3）.** Never paraphrase, reorder, reformat, dedent, or "improve" the user's text. 照抄时逐字节照抄，**包括** `==highlights==`、Tab 缩进、以及打错的字。没有时间戳前缀。
    R3 拦的是「擅自」—— 你自己动笔改就违反。两道**授权**改写也走脚本，不走你手写：`--fix-pair`（第 2 步查出、用户点头才改，是**闸门**）与 `--fix-written`（用户事后点名要改，是**例外**）。
+   **R3 的射程是 `jc` 原文层**（D19）。`## 今日待办`（`jt` 区）是另一层、天然可变：勾选、改期、拖动、删除全归用户，不受 R3 与 `--fix-written` 的 `--id` 限制约束。两个例外不变：内容仍逐字节来自用户，转换由你提出、用户点头。
 2. **默认 dry-run（D3）.** Show the diff first. Only run with `--write` after the user confirms. dry-run 不落盘、也**不创建**当日笔记：笔记不存在时直接报 `note-not-found`（默认当日路径要建它得显式加 `--write`，或先跑 `scripts/journal_create.sh`；显式 `--path` 指向的文件脚本一律不建）。
 3. **不确定就问（D5）.** If the classification, the anchor, or the target note is uncertain, stop and ask. Never guess and never silently leave something `unsorted`.
 4. **Never touch `### 关联笔记`** (the dataviewjs block), the tasks blocks, or any other note.
@@ -215,7 +216,7 @@ scripts/journal_apply.mjs \
 
 原文里**实际点名**的实体，库里有笔记就链（见硬规则 7）：有几个填几个。没有对应实体就留 `—`，但不要为了不留空硬凑。
 
-The command prints a unified diff and the `verify` object. **Check that all five flags are true**, especially `bodyExact` and `originalsPreserved`.
+The command prints a unified diff and the `verify` object. **Check that all six flags are true** —— `bodyExact` / `originalsPreserved` 管的是**内容守恒**，`blockInSection` 管的是**位置正确**（新块真的落在 `## 今日的思考` 里，D25）。
 
 ### 6. Write after confirmation
 
@@ -223,11 +224,166 @@ Re-run the same command with `--write`. Confirm the output says `status: written
 
 ### 7. Report back
 
-Tell the user: the target path, the block `id`, the chosen tag(s), which candidate you picked (or that the tag is newly invented), and any candidate you had to break a tie between.
+Tell the user: the target path, the block `id`, the chosen tag(s), which candidate you picked (or that the tag is newly invented), and any candidate you had to break a tie between. If the captured text contained anything that looked like a todo, also 走「待办提取」那节 —— 把候选待办一并摆给他判断，等他逐条点头再写。
 
 ## Repeating
 
 Each additional capture in the same conversation is a new block appended after the previous one, plus a new row in the derived index table. Re-running the exact same text is idempotent and reports `duplicate`.
+
+待办是另一回事：新行插在 `jt:end` 之前（区里已有的行不动），判重按**行**而不是按块。详见下一节。
+
+## 待办捕获（`--kind=todo`）
+
+用户说「记个待办」「提醒我明天交房租」时走这条通道：**只追加任务行，一个字节也不动 `jc` 原文层**。
+第 3、4 步（建日记、分类）不适用 —— 待办不产生索引行，也不需要 `--category`。
+
+```bash
+cat > /tmp/dj-todo.txt <<'EOF'
+- [ ] 交房租 #gtd/next-action 📅 2026-09-25
+- [ ] 等快递 #gtd/wait-for
+EOF
+
+scripts/journal_apply.mjs --kind=todo --proofread --content-file=/tmp/dj-todo.txt   # 先校对
+scripts/journal_apply.mjs --kind=todo --content-file=/tmp/dj-todo.txt               # dry-run
+scripts/journal_apply.mjs --kind=todo --content-file=/tmp/dj-todo.txt --write       # 确认后落盘
+```
+
+`--kind` 缺省是 `thought`：不传时行为与改动前逐字节相同。
+
+### 为什么是另一层（D19）
+
+待办**不能**放进 `jc` 块：`id = sha1(正文)`，用户每勾一次 checkbox、每改一次期，正文就变，
+`--verify-ids` 第二天就报一片不一致 —— 那份体检报告会立刻失去意义。
+所以待办落在新的 `## 今日待办` 节（`jt` 标记对，**无 id**），三层变四层。
+
+固定节序：**思考 → 待办 → 派生 → 关联**。待办节不存在时由 skill 建在派生层之前；
+被用户拖到派生层之后时视为**不存在**（退回改动前的行为，不报错）。
+
+### 逐条确认，不静默加工
+
+- 每行都要是**一行 checkbox**。用户给的是「明天交房租」这种口语，**你转成任务行之前要先给他看**，
+  别默默把口语改成 `- [ ]`。这跟 R3 同一个立场：转换由你提出、用户点头。
+- **日期一律绝对化**（D24）。`明天` / `下周三` / `三天后` 由脚本报 `task-date-relative` 并**阻断落盘**，
+  你给出建议值（脚本按**笔记日期**推算，不是运行日），用户确认后用 `--fix-pair` 落地。
+  对里的右值**要带够上下文**，否则句子会读不通：
+
+  ```bash
+  --fix-pair='明天去取车→2026-09-21 去取车'    # ✅ 句子还读得通（笔记日期 2026-09-20 时，明天 = 09-21）
+  --fix-pair='明天→2026-09-21'                # ⚠️ 会变成「2026-09-21去取车」
+  ```
+
+- **`➕` 由脚本自动补**（默认开，`--no-task-add-created` 关），取的是**笔记日期**，不是运行日。
+  补记昨天的日记时运行日是错的那一天，而错值的行仍然完全合法、待办通道那五项校验全绿 —— 没有任何机械守卫拦得住（D22）。
+- **分类写在行内标签**里（如 `#family`），待办**不产生索引行**（D21），所以不用给 `--category`；
+  也不要给 `--links`（脚本会拒）。`#gtd/next-action` / `#gtd/wait-for` 是**任务状态**、不是主题分类，两个词表分开。
+- V1 **只落当天日记**，不路由到 `10-GTD/*`（D23）。
+
+### 校对项（`--kind=todo` 专属）
+
+这条通道**只跑**下面这一套。通用的散文检查在任务行上全是噪音：行内的 `#gtd/next-action` 会被当成英文词报 `ascii-case`。
+
+| kind | 含义 | 处置 |
+| --- | --- | --- |
+| `task-no-checkbox` | 顶格行不是一行 checkbox | **阻断** |
+| `task-status-unknown` | `- [?]` 不在四种状态符里 | **阻断** |
+| `task-date-relative` | `明天` / `下周三` / `三天后` | **阻断**，确认后走 `--fix-pair` |
+| `task-date-format` | `2026/9/25` | 直改（`--fix=safe`） |
+| `task-field-order` | emoji 字段顺序乱 | 需确认 |
+| `task-indent-mixed` | 同一块内 Tab 与空格混用 | 需确认 |
+| `task-tag-unknown` | `#gtd/xxx` 不在库内状态集 | 需确认 |
+
+**阻断项是硬闸**：`--write` 前脚本把 `--fix-pair` / `--fix` 都套完，再看一遍**真正要落盘的那份文本**，
+还剩阻断项就不落盘（退出 1）。所以修正与写入可以同一条命令，也可以先修好再写。
+
+### 幂等与重复
+
+判重按**行**（rstrip 后全等，扫整个 `jt` 区），不靠 id：
+
+- 整批都已在区里 → `status: duplicate`，退出 0，**文件字节不变**。
+- 只有一部分重复 → 报 `task-line-duplicate`，退出 6，**不静默跳过重复行** ——
+  否则用户以为三条都记上了，实际只落两条。
+
+## 待办提取：从已有内容里挑待办（提案，不落盘）
+
+上面那节是**你直接把待办交给我**；这节是**内容里藏着待办，我挑出来交给你**。
+方向反过来：我只管提案，一个字也不写。
+
+两个触发：
+
+1. **捕获思考时顺手扫一遍**。内容已经过你的手，扫一眼不额外花什么。
+2. **回溯已有日记**：用户说「把今天的待办挑出来」「这段里有没有待办」。读 `02-Done/` 里对应笔记就行（如 `obsidian vault=nextlink read path=...`），**只读不改**。
+
+### 提案长什么样
+
+```text
+刚记下的内容（原文已落入 20:00 块 `20260920-2000-a1b2`）：
+
+> 明天要交房租，顺便把水电费也交了。另外别忘了周四前回复老王。
+
+我看出 3 条可能的待办，请逐条判断：
+
+| # | 建议的任务行 | 依据 | 需要你定的 |
+| --- | --- | --- | --- |
+| 1 | `- [ ] 交房租 #family 📅 2026-09-21` | 「明天」= 笔记日期 +1 | 日期对不对 |
+| 2 | `- [ ] 交水电费` | 「顺便也交了」 | 算不算独立一条 |
+| 3 | `- [ ] 回复老王 #work` | 「周四前」 | 哪个项目、要不要 due |
+```
+
+然后**停下来等**。用户回「1、3 要，日期都对，2 不要」之后，才用那几句话去跑 `--kind=todo`。
+他没回，就只留原文 —— 提案是只读的，没写任何东西。
+
+### 提什么，不提什么
+
+提：明确的**承诺或动作** —— 「要交房租」「回复老王」「记得带伞」。
+
+不提：感慨、判断、方案、疑问（「我在想要不要换工作」「这个方案可能不太行」）。
+
+**拿不准就不提，或者只问一句**（D5）。宁少勿多：把一句感慨提成待办比漏掉一条更难看，
+而且用户还要花时间否掉它。
+
+一句话能拆出多条时，**默认拆开列**并标出是你拆的 —— 用户合并比拆错容易。
+
+### 硬约束
+
+- **原文一个字不动**（R3 / D19）。提取是在 `jt` 层新建行，不是在 `jc` 层编辑。
+  原文里的「明天要交房租」原封不动留着，新行是另一条独立存在的描述。
+- **允许改写原句来造任务行**，但**必须逐条给用户看最终文字** ——
+  「明天要交房租」→ `- [ ] 交房租 📅 2026-09-21`，删了「要」、语序也动了。
+  `jt` 层不受 R3 约束，但文字毕竟还是用户的，所以还是回到同一句话：**转换由你提出、用户点头**。
+- **日期仍然不猜**（D24）。提案里给**建议值**并标出源词（「明天」「周四前」），
+  用户确认后才写。落盘时如果需要机械替换，走 `--fix-pair`。
+- **提案里的行也要先过闸门**。提取出的行和直接给的待办走**同一条** `--kind=todo` 通道，
+  同样过校对项与五项写入校验；不确定就先 dry-run 看一眼。
+
+### 标出来源（可关）
+
+提取出的待办默认带一个**别名块链接**，点一下跳回它来自哪句话。**位置在描述末尾、emoji 字段之前**：
+
+```text
+- [ ] 交房租 #family [[2026-09-38w-20#^20260920-2000-a1b2|↩]] ➕ 2026-09-20 📅 2026-09-21
+```
+
+三个部件各有理由：
+
+- **别名 `|↩`**：渲染出来只是一个小箭头，但它是真链接、能点。不写别名，就是一长串 `2026-09-38w-20#^20260920-2000-a1b2` 摊在任务描述里。
+- **带笔记名**，不是光写 `#^id`：`[[#^id]]` 是**同文档**引用，而来源块可能不在当天这篇里。
+- **不能放注释里**：写在 `<!-- -->` 里的 `[[…]]` **不进链接表**（实测：同一篇里注释内、注释外各放一条指向同一个块锚点，metadata cache 只登记了外面那条）—— 不显形，也点不动。
+
+链接的另一头是块的**尾部锚点**（`^<块 id>`），新捕获的块自动就有。
+
+**位置为什么必须在这儿。** Tasks 的每个字段正则都**锚定行尾**（源码里 `Da()` 拼完符号就 `e += "$"`），
+解析时**从右往左反复剥**（`extractField`：`line.match(regex)` → 命中就 `line.replace(regex,"")` → 再轮）。
+所以行尾必须**正好**是一个字段，链接、注释、任何别的文字都只能挤在描述里。挂到行尾就全完：
+`📅 …$` 匹配不上 → 一个字段也剥不下来 → `createdDate` 变 `null` →
+这条待办**不会出现在「今日创建的任务」里**（`(created …)` 靠的就是它；日记标题里又没有日期，`heading includes` 也救不了）。
+
+反方向也查过：链接里的 `#` 前面是文件名字符而不是空白，Obsidian 与脚本都不当标签；
+脚本的 `wikilink-missing` 只拿 `#` 前的部分对词表，所以够得着、不误报。
+
+> 同一个坑：行尾任何非字段文字都会让**全部**日期字段解析失败。
+> 库里就有一条现存例子：`- [ ] fzy 和 fzf 的区别 ➕ 2026-06-25 】` —— 挂了个 `】`，`➕` 就不认了。
+
+不想要这个链接就一句话去掉，不影响其他任何机制。
 
 ## 事后修正：改已写入的原文
 
@@ -248,20 +404,58 @@ scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便�
 1. **命中数校验** —— 报出每个对在该块内命中几次；
 2. **反向回代守卫** —— 把改后正文反向换回来必须逐字节等于改前。右值在原文里本来就出现过时，替换会互相干扰，直接拒绝；
 3. **块外不动** —— 把块内替换全部推回去后必须正好等于原文；
-4. **id 重算** —— 正文变了 sha1 就变，id 必须跟着改（含索引行），否则「同内容 → 同 id」的幂等前提就断了。
+4. **id 重算** —— 正文变了 sha1 就变，id 必须跟着改（含索引行与块尾锚点），否则「同内容 → 同 id」的幂等前提就断了。
 
 **模型绝不可以自己改日记文件。** 哪怕只改一个字，也必须走这条路径；否则「原文不得擅自改写」就变成一句空话。
+
+**块外文本走 `--repair-text`。** `--fix-written` 只管 `jc:begin`/`jc:end` 之间的正文。派生区里、模板片段里、`## 今日待办` 里出现的**机械错字**（比如某次写入被 CLI 改坏了一个字），走同族的修复通道：
+
+```bash
+scripts/journal_apply.mjs --repair-text --path=02-Done/2026-09-38w-18.md --replace='设???脚本在库中的相对路径→设置脚本在库中的相对路径'
+scripts/journal_apply.mjs --repair-text --path=… --replace='…→…' --write
+```
+
+七道闸，缺一条就一个字不写：只认 `--path` 指定的这一个文件；每对必须**恰好命中一次**（0 次或多次都拒，想限定就给更长的上下文）；命中落在任何 `jc` 块体内就拒，并叫你改用 `--fix-written`（那边有 id 一致性约束）；`--replace` 两边不许含换行；反向回代必须逐字节回到原文；命中处之外必须一个字节没变；缺省 dry-run。
+同一层里换掉旧式来源标记（`<!-- from:2026… -->` → `[[笔记#^id|↩]]`）也走这条通道。
+
+## 写入完整性：宁可不写，不可写坏
+
+日记是本 skill 唯一不可重建的数据，**静默写坏是这里最坏的失败**。实测到一个真实的传输失真：`obsidian` CLI 解析 `code=` 入参时，约每 **8192 字节**会吃掉**多字节字符** —— 一个中文变成三个 U+FFFD，同一份载荷逐字节可复现；纯 ASCII 与几 KB 以内的短参数（`path=` 等）不受影响；回程（Obsidian → Node）测到几百 KB 中文无损。
+脚本两道防：
+
+1. **入参转纯 ASCII** —— 进 `code=` 之前把非 ASCII 全写成 `\uXXXX`（语义等价）。没有多字节序列，就没有可被切断的东西。
+2. **载荷自带指纹** —— Node 算 `len` + 31 进制滚动和，Obsidian 收到后**落盘前先自查**，对不上就返回 `transport-corrupt`、**一个字都不写**；写后回读再自查一遍。
+
+只比字符串是不够的：两边一起被改坏时字符串照样相等。校验和保证「永不静默写坏」，ASCII 转义保证「根本不发生」。
+**每一条落盘路径都要过这道指纹自查**：六个改写通道（`--fix-written` / `--repair-text` / `--migrate-tags` / `--link-block-ids` / `--add-anchors` / `--verify-ids --write`）走 `writeNoteInObsidian()` 一处实现，捕获通道（思考 / 待办）在写盘前自查同一套 `len` + 滚动和 —— 没有哪条通道只剩字符串相等这一层。
+
+改完脚本先跑**离线自检**（不碰库、不需要 Obsidian 在运行；假 `app` 替掉 Obsidian）：
+
+```bash
+node tools/payload-selftest.mjs    # 契约一改这里先红：锚点、幂等、撞 id、载荷指纹、ASCII 转义
+```
+
+它跟脚本同仓库同版本：这些路径都是「不报错、只是静默做错」，靠读代码看不出来，靠人手在真库里试又会写坏日记。
 
 ## 自检：块 id 是否仍与正文自洽
 
 ```bash
 scripts/journal_apply.mjs --verify-ids          # 只报告，不一致退 1
-scripts/journal_apply.mjs --verify-ids --write  # 把对不上的 id 重算回一致（正文不动）
+scripts/journal_apply.mjs --verify-ids --write  # 把对不上的 id 重算回一致（正文不动，连带派生层索引行的链接）
 ```
 
 `id = <YYYYMMDD>-<HHmm>-<sha1(正文) 前 4 位>`。等式断了就说明正文在写入后被改过，或者来自旧版脚本。这是「原文有没有被悄悄改过」最便宜的一条证据。
 
+**块尾锚点。** 每块正文最后一行的末尾钉着一个空格加 `^<块 id>`，于是 `[[2026-09-38w-20#^20260920-1037-8dc5]]` 能直接跳到那段思考。
+
+Obsidian 只给落在一段**真文本**里的锚点注册块 —— 整行只有 `^id`、或跟在别的字后面都行，**HTML 注释行不算**（实测：写在 `<!-- -->` 里的 `[[…]]` 不进链接表，点不动）。所以锚点不能挂在 `jc:end` 上，只能挤进正文最后一行。
+
+**锚点不算正文。** 算 sha1、比对幂等之前一律先剥掉：不剥，锚点里的 id 会自指进 hash，而同一段思考第二次捕获也会被当成新块重复写。`--verify-ids` 因此报两件事 —— 正文 hash 对不对、锚点值是不是等于块 id；任一不对，`--write` 一起修回来（**四处**：`jc:begin` / `jc:end` / 尾部锚点 / 派生层索引行的块链接）。**旧块没有锚点照样通过**，脚本也不会借修 id 的机会替它补上。
+
 id 是 agent 生成的 opaque 锚点、不是用户写的话，所以重算它不触碰 R3 —— 但正文仍必须逐字节不变，脚本会自己验证。
+
+`--verify-ids --write` 与 `--fix-written` 换 id 时**只动索引行的那一格**（`remapIndexRowIds`，形态无关：反引号与块链接都认），
+`## 今日待办` 里用户自己的 `` [[…#^id|↩]] `` 不被牵连 —— 那是另一层、另一件事（已知缺口：待办出处链接不会跟着重算，暂不自动改）。
 
 ## 迁移派生层的历史分类
 
@@ -273,6 +467,31 @@ scripts/journal_apply.mjs --migrate-tags --map='life/HomeLab→life' --write
 ```
 
 它只改派生层索引行的分类列（原文与关联列一个字节不动），且每个结果标签仍要过 `validateTags`；出现词表外的新标签会被拦下（D5）。混写的行（分类列里已经有裸标签）不会被碰。
+
+## 迁移派生层的块 id 成块链接
+
+派生层（见 `references/decision-log.md` C12/C13）的「块 id」列写的是**可点的块链接**：
+
+```markdown
+| 时间 | 块 id | 分类 | 关联 |
+| --- | --- | --- | --- |
+| 10:25 | [[2026-09-38w-20#^20260920-1025-e95b\|20260920-1025-e95b]] | #family | — |
+```
+
+点一下直接跳回那段思考（别名就是 id 文本，不写别名 Obsidian 会渲染成「笔记名 > 块 id」，这一列被撑得很长）。
+新捕获自动就是这个形态；**历史笔记里裹反引号的旧形态**（`` `20260920-1025-e95b` ``）用迁移模式补：
+
+```bash
+scripts/journal_apply.mjs --link-block-ids         # dry-run，列出会改哪几行、没动的为什么没动
+scripts/journal_apply.mjs --link-block-ids --write
+```
+
+**三条约束**：只改索引行的 id 那一格（原文与其余三列一个字节不动）；块必须真在本文件里（找不到报 `block-missing`，不写）；
+块必须**已经有尾部锚点** —— 没锚点链接就跳不过去。这里**不代劳补锚点**，只报 `anchor-missing`，叫你先跑 `--add-anchors`（两件事分开，各自可核）。
+
+> 别名里的 `|` 必须逃成 `\|`，这跟关联列是同一条 markdown 规则。解析侧因此一律按**未转义的 `|`** 拆列
+> （`splitUnescapedPipes`）。拿 `split("|")` 硬拆的坑实测过：块 id 列里一旦出现 `\|`，列序号整体后移，
+> `--audit` 的 `cells[3]` 拿到的就不是分类列 —— 那些行被**悄悄丢掉**（不报错，只是结果少几行）。
 
 ## Other modes
 
@@ -295,8 +514,17 @@ scripts/journal_path.sh
 # 校块 id 与正文是否自洽（只读，不一致退 1）
 scripts/journal_apply.mjs --verify-ids
 
-# 把派生层裘反引号的历史分类迁移成裸标签（dry-run）
+# 给旧块补上尾部锚点（纯追加，让 [[笔记#^id]] 跳得回来；dry-run）
+scripts/journal_apply.mjs --add-anchors
+
+# 修 jc 块之外的机械错字（模板片段、派生区、待办行；dry-run）
+scripts/journal_apply.mjs --repair-text --path=02-Done/2026-09-38w-18.md --replace='错字→正字'
+
+# 把派生层裹反引号的历史分类迁移成裸标签（dry-run）
 scripts/journal_apply.mjs --migrate-tags --map='life/HomeLab→life'
+
+# 把派生层裹反引号的块 id 迁移成块链接（dry-run；块缺尾部锚点的先跑 --add-anchors）
+scripts/journal_apply.mjs --link-block-ids
 
 # 事后改已写入的原文里的错字（dry-run）
 scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便宜→漂移'
@@ -311,7 +539,11 @@ scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便�
 | `id-collision` | Same id, different text. Report both and ask; never overwrite. |
 | `--category 不合法` | 不是合法标签，或是被剔除的 `#gtd/*` / 纯数字 / 单字符标签。先跑 `--tags` 与 `--classify`，不要臆造。 |
 | `--category` 里有词表外的新标签 | 缺 `--allow-new-tag`。这是 D5 的机械闸门：**先问用户**，点头后再加旗标重跑。 |
-| `pre-write-verify-failed` | A verbatim/idempotency check failed. Nothing was written. Report the failed flag. |
+| `pre-write-verify-failed` | 六项校验有一项没过。什么都没写。报告具体是哪一项。`blockInSection` 失败 = 新块被拼到区外（D25）。 |
+| `orphan-jt-markers` | `jt` 标记不是正好一对，或不在 `## 今日待办` 节内（比如待办节被拖到了派生层之后）。先看库内实际状态再问用户，不要自己补标记。 |
+| `task-line-duplicate` | 待办行部分重复。**不静默跳过**，退 6，文件不变。把要落的那几条单独重跑。 |
+| `--kind 只能是 thought 或 todo` | 旗标拼错了。检查 argv，**不要**改成默认值重跑 —— 那会把待办写进原文层。 |
+| `待办捕获没通过校对` | 还剩阻断项（相对时间 / 错状态符 / 非任务行）。按提示修好再重跑，退 1，文件不变。 |
 | `orphan-index-markers` | The derived-layer markers are half-present. Ask the user before repairing. |
 | `index-markers-missing` | `jc:index` 标记整块缺失。不要自己补，先看库内实际状态再问用户。 |
 | `note-not-found` | 当日笔记不存在。dry-run 只报不建；跑 `scripts/journal_create.sh`，或确认后加 `--write` 让捕获路径建它。显式 `--path` 指向的文件脚本不会建，加 `--write` 也不行。 |
@@ -327,10 +559,18 @@ scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便�
 | `回代校验失败` | `--fix-written` 的右值在原文里本来就出现过，替换会互相干扰。换更长的上下文再试，不要用会撞车的对。 |
 | `块外内容被牵连` | 脚本 bug，已中止未落盘。把现场给用户看，不要自己绕过去。 |
 | `迁移后不合法` / `迁移后出现词表外的新标签` | `--migrate-tags` 会被拦下。用 `--map` 指定映射，或先问用户再 `--allow-new-tag`。 |
+| `block-missing` | `--link-block-ids` 在**本文件里**没找到这个块 id。不猜、不跨文件补，报告给用户。 |
+| `anchor-missing` | 块没有尾部锚点，链接跳不过去。先跑 `--add-anchors`，再重跑 `--link-block-ids`。 |
+| `end 标记缺失` | 块的 `jc:end` 不见了（半个块）。先跑 `--verify-ids` 看清楚，不要拿迁移通道去修。 |
 | `--fix-written 需要 --id` | 没给块 id。先 `grep -rn 'jc:begin id='` 找到它，**不要**改成全库替换。 |
+| `transport-corrupt` | 待写内容在传进 Obsidian 的路上被改过，**一个字未写**。本脚本已转义送出，仍出现就升级 `obsidian` CLI，并把这条记进 decision-log。 |
+| `命中落在 jc 块体内` | `--repair-text` 撞到了块内正文。改用 `--fix-written --id=<块 id>`，那边会连带重算 id。 |
+| `命中 N 次，不止一处` | `--repair-text` 只修一处。把 `--replace` 的左边加长到全文件唯一。 |
 
 ## Fixing a wrong classification
 
 Edit the 「分类」 column in the derived layer directly — it holds bare tag(s) (e.g. `#work/sales #门店`), **not** wrapped in backticks, otherwise Obsidian will not treat them as tags. It is agent-maintained and rebuildable; the original text and the marker blocks must stay untouched.
 
 旧日记里可能还留着裹反引号的旧格式（`` `work/sales` ``），那不是标签，不会进图谱。**不要手改**，用 `--migrate-tags`（见上一节）。
+
+「块 id」列同理：它是可点的块链接，**不要**改回裹反引号的旧形态；历史笔记里还留着的旧形态用 `--link-block-ids` 补。

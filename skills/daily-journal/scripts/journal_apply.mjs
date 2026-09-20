@@ -42,9 +42,23 @@ let CLI_ARGS = {};
 
 const SECTIONS = {
   thinking: "今日的思考",
+  todo: "今日待办",
   derived: "今日分类与关联",
   related: "关联笔记",
 };
+
+// 日记笔记名形如 2026-09-38w-19（= date "+%G-%Vw-%d"），由此推出「这条笔记是哪天」。
+// ➕ 必须等于**笔记日期**而不是脚本运行日（D22）：补记昨天时错一天，行本身仍完全合法，
+// 五项校验全绿，没有任何机械守卫能拦住 —— 只能靠这里取对值。
+const DAILY_BASENAME_RE = /^(\d{4})-(\d{2})-\d{2}w-(\d{2})$/;
+
+// 块尾锚点 ` ^<块 id>`，钉在正文最后一行的末尾，让 [[笔记#^id]] 能跳到这段思考。
+// Obsidian 只认落在一段**真文本**里的锚点（整行只有 ^id，或跟在别的字后面都行）；
+// HTML 注释行认不认没实测过，不赌它，所以锚点不挂在 <!-- jc:end … --> 上，只挤进正文。
+// 代价与口径：**锚点不算正文** —— 算 sha1、比对幂等之前一律先剥掉，
+// 否则锚点里的 id 会自指进 hash（id 是 sha1(正文)，锚点又是 id）。
+const TAIL_ANCHOR_RE = / \^[A-Za-z0-9._-]+$/;
+const stripTailAnchor = function (s) { return s.replace(TAIL_ANCHOR_RE, ""); };
 
 // ---------------------------------------------------------------------------
 // 基础工具
@@ -132,8 +146,18 @@ function obsidian(vault, args) {
   }
 }
 
+// obsidian CLI 解析 code= 入参时，约每 8192 字节会吃掉几个**多字节字符**（中文/emoji 变成
+// U+FFFD，纯 ASCII 不受影响；同一载荷逐字节可复现；回程 stdout 测到 240KB 无损）。
+// 所以进 code= 前把非 ASCII 全部写成 \\uXXXX 转义——语义完全等价，但入参变成纯 ASCII，
+// 不再有可被切坏的多字节序列。另见 FIXWRITTEN_PAYLOAD 里的 afterSum 落盘前自查。
+function escapeNonAsciiForCli(code) {
+  return code.replace(/[\u007f-\uffff]/g, (c) =>
+    "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")
+  );
+}
+
 function evalInObsidian(vault, code) {
-  const raw = obsidian(vault, ["eval", "code=" + code]);
+  const raw = obsidian(vault, ["eval", "code=" + escapeNonAsciiForCli(code)]);
   const m = raw.match(/^=> (.*)$/m);
   if (!m) throw new Error("eval 无返回值:\n" + raw.slice(0, 800));
   return JSON.parse(m[1]);
@@ -160,7 +184,23 @@ const WRITE_PAYLOAD = String.raw`
 (async () => {
   const P = globalThis.__DJ_P;
   const NL = "\n";
-  const BT = String.fromCharCode(96);
+  const sumOf = function (s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return h;
+  };
+  // 落盘前先拿 Node 算的 len/sum 自查（C11）：载荷在 code= 入参上被改写就一个字都不写。
+  // 字段顺序必须与 Node 侧 captureStampSrc() 逐字对应；捕获通道由此不再只剩「字符串相等」一层。
+  const stampSrc = [P.content, P.anchor, P.id, P.time, P.noteDate, P.createdDateSource, P.category, P.links, P.sections.thinking, P.sections.todo, P.sections.derived, P.sections.related].join("\u0000");
+  if (stampSrc.length !== P.stampLen || sumOf(stampSrc) !== P.stampSum) {
+    return JSON.stringify({
+      ok: false,
+      error: "transport-corrupt",
+      path: P.path,
+      gotLen: stampSrc.length,
+      wantLen: P.stampLen
+    });
+  }
   const file = app.vault.getAbstractFileByPath(P.path);
   if (!file) return JSON.stringify({ ok: false, error: "note-not-found", path: P.path });
 
@@ -172,7 +212,7 @@ const WRITE_PAYLOAD = String.raw`
     return m ? { level: m[1].length, text: m[2] } : null;
   };
 
-  let rawStart = -1, related = -1, derived = -1;
+  let rawStart = -1, related = -1, derived = -1, todo = -1;
   for (let i = 0; i < lines.length; i++) {
     const h = head(lines[i]);
     if (!h) continue;
@@ -180,18 +220,162 @@ const WRITE_PAYLOAD = String.raw`
     if (rawStart >= 0) {
       if (related < 0 && h.level === 3 && h.text === P.sections.related) related = i;
       if (derived < 0 && h.level === 2 && h.text === P.sections.derived) derived = i;
+      if (todo < 0 && h.level === 2 && h.text === P.sections.todo) todo = i;
     }
   }
   if (rawStart < 0) return JSON.stringify({ ok: false, error: "section-missing", detail: P.sections.thinking, path: P.path });
   if (related < 0) return JSON.stringify({ ok: false, error: "section-missing", detail: P.sections.related, path: P.path });
   if (derived >= 0 && !(derived > rawStart && derived < related)) derived = -1;
+  // 待办节必须在思考层与派生层（或关联笔记）之间；被拖到别处就当它不存在，
+  // 退回改动前的行为 —— 不报错，也不把块写进去。与 derived 的守卫同一条口径。
+  const todoEnd = derived >= 0 ? derived : related;
+  if (todo >= 0 && !(todo > rawStart && todo < todoEnd)) todo = -1;
+  const isTodo = P.kind === "todo";
 
   const beginRe = /^<!--\s*jc:begin\s+id=([A-Za-z0-9._-]+)\s*-->$/;
   const endRe = /^<!--\s*jc:end\s+id=([A-Za-z0-9._-]+)\s*-->$/;
   const idxBeginRe = /^<!--\s*jc:index:begin\s*-->$/;
   const idxEndRe = /^<!--\s*jc:index:end\s*-->$/;
   const norm = function (s) { return s.replace(/\s+$/, ""); };
-  const bodyOf = function (arr) { return arr.map(norm).join(NL).trim(); };
+  const tailAnchorRe = / \^[A-Za-z0-9._-]+$/;
+  const stripTailAnchor = function (s) { return s.replace(tailAnchorRe, ""); };
+  // 比对正文（撞 id / 幂等）时先剥锚点：不剥，同一段思考第二次捕获就对不上，会被当新块重复写。
+  const bodyOf = function (arr) { return stripTailAnchor(arr.map(norm).join(NL).trim()); };
+
+  // 落盘 / 读回是两条写入通道（思考 / 待办）共用的尾段。口径只能有一处，
+  // 否则就会出现「写盘会并发守卫、另一条不会」这类两个入口两个口径的缺陷（D18）。
+  const commit = async function (out, after) {
+    if (!P.write) {
+      out.status = "dry-run";
+      out.before = before;
+      out.after = after;
+      return JSON.stringify(out);
+    }
+    let concurrent = false;
+    await app.vault.process(file, function (data) {
+      if (data !== before) { concurrent = true; return data; }
+      return after;
+    });
+    if (concurrent) {
+      out.ok = false;
+      out.status = "concurrent-edit";
+      out.error = "concurrent-edit";
+      return JSON.stringify(out);
+    }
+    const readBack = await app.vault.read(file);
+    const readBackExact = readBack === after;
+    out.status = readBackExact ? "written" : "readback-mismatch";
+    out.ok = readBackExact;
+    out.readBackExact = readBackExact;
+    if (!readBackExact) out.readBack = readBack;
+    out.before = before;
+    out.after = after;
+    return JSON.stringify(out);
+  };
+
+  if (isTodo) {
+    const tBeginRe = /^<!--\s*jt:begin\s*-->$/;
+    const tEndRe = /^<!--\s*jt:end\s*-->$/;
+
+    // jt 区整节唯一、无 id（D20）：一对标记，且必须都落在待办节里。
+    const bIdx = [], eIdx = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (tBeginRe.test(lines[i])) bIdx.push(i);
+      if (tEndRe.test(lines[i])) eIdx.push(i);
+    }
+    if (bIdx.length > 1 || eIdx.length > 1 || bIdx.length !== eIdx.length) {
+      return JSON.stringify({ ok: false, error: "orphan-jt-markers", detail: "jt:begin " + bIdx.length + " 个 / jt:end " + eIdx.length + " 个", path: P.path });
+    }
+    const jtFrom = bIdx.length === 1 ? bIdx[0] : -1;
+    const jtTo = eIdx.length === 1 ? eIdx[0] : -1;
+    if (jtFrom >= 0 && (todo < 0 || jtFrom <= todo || jtTo >= todoEnd)) {
+      return JSON.stringify({ ok: false, error: "orphan-jt-markers", detail: "jt 标记不在 ## " + P.sections.todo + " 节内", path: P.path });
+    }
+
+    const todoLines = P.content.split(NL).map(norm);
+    const adds = todoLines;
+    const addsNonBlank = adds.filter(function (s) { return s !== ""; });
+    const region = jtFrom >= 0 ? lines.slice(jtFrom + 1, jtTo).map(norm) : [];
+    const have = Object.create(null);
+    for (const l of region) have[l] = 1;
+    const dup = [], fresh = [];
+    for (const l of addsNonBlank) {
+      if (have[l] === 1) { if (dup.indexOf(l) < 0) dup.push(l); } else fresh.push(l);
+    }
+    if (dup.length > 0 && fresh.length === 0) {
+      return JSON.stringify({ ok: true, status: "duplicate", kind: "todo", path: P.path, duplicateLines: dup, taskCountBefore: addsNonBlank.length, taskCountAfter: region.filter(function (s) { return s !== ""; }).length });
+    }
+    // 部分重复不能静默跳过 —— 那就成了一条静默失效（D18）：用户以为三条都记上了，实际只落两条。
+    if (dup.length > 0) {
+      return JSON.stringify({ ok: false, error: "task-line-duplicate", duplicateLines: dup, newLines: fresh, path: P.path });
+    }
+
+    let after;
+    if (jtFrom >= 0) {
+      after = lines.slice(0, jtTo).concat(adds, lines.slice(jtTo)).join(NL);
+    } else if (todo >= 0) {
+      // 节在、标记不在：把标记对补在节体末尾，用户写在节里的内容原样留在上方。
+      // 前后各留一个空行：body 末尾那个空行正好当 jt:begin 前的分隔，但 jt:end 后面
+      // 卸下的是下一个 H2，不自己补一个就会把标题顶上去（MD022）。
+      const body = lines.slice(todo + 1, todoEnd);
+      const ins = [];
+      if (body.length === 0 || body[body.length - 1].trim() !== "") ins.push("");
+      ins.push("<!-- jt:begin -->");
+      for (const l of adds) ins.push(l);
+      ins.push("<!-- jt:end -->", "");
+      after = lines.slice(0, todoEnd).concat(ins, lines.slice(todoEnd)).join(NL);
+    } else {
+      // 节也不在：整节建出来，插在派生层（或关联笔记）之前
+      const sec = ["## " + P.sections.todo, "", "<!-- jt:begin -->"].concat(adds, ["<!-- jt:end -->", ""]);
+      after = lines.slice(0, todoEnd).concat(sec, lines.slice(todoEnd)).join(NL);
+    }
+
+    const aLines = after.split(NL);
+    let ab = -1, ae = -1, nB = 0, nE = 0, hIdx = -1;
+    for (let i = 0; i < aLines.length; i++) {
+      if (tBeginRe.test(aLines[i])) { nB++; if (ab < 0) ab = i; }
+      if (tEndRe.test(aLines[i])) { nE++; if (ae < 0) ae = i; }
+      const h = head(aLines[i]);
+      if (hIdx < 0 && h && h.level === 2 && h.text === P.sections.todo) hIdx = i;
+    }
+    // 区内容纯净：区内每一行要么是子项（缩进），要么是列表项，不能夹着裸文字。
+    let clean = ab >= 0 && ae > ab;
+    for (let i = ab + 1; clean && i < ae; i++) {
+      const l = aLines[i];
+      if (l.trim() === "") continue;
+      if (/^[ \t]/.test(l)) continue;
+      if (/^[-*+](\s|$)/.test(l)) continue;
+      clean = false;
+    }
+    const regionAfter = ab >= 0 ? aLines.slice(ab + 1, ae).map(norm) : [];
+    const allInserted = addsNonBlank.filter(function (l) { return regionAfter.indexOf(l) < 0; }).length === 0;
+    // inSection：标记必须真的在 ## 今日待办 这一节里，中间不能冒出任何标题。
+    // 这是本区专用的 blockInSection，与思考通道那条同源：查的是「放对了没有」。
+    let stray = false;
+    for (let i = hIdx + 1; i < ab; i++) { if (head(aLines[i])) { stray = true; break; } }
+
+    let sub = 0;
+    for (let j = 0; j < aLines.length && sub < lines.length; j++) if (lines[sub] === aLines[j]) sub++;
+
+    const tverify = {
+      jtPairPresent: nB === 1 && nE === 1,
+      inSection: hIdx >= 0 && ab > hIdx && !stray,
+      linesInserted: allInserted,
+      regionClean: clean,
+      originalsPreserved: sub === lines.length
+    };
+    tverify.allOk = tverify.jtPairPresent && tverify.inSection && tverify.linesInserted && tverify.regionClean && tverify.originalsPreserved;
+    if (!tverify.allOk) {
+      return JSON.stringify({ ok: false, error: "pre-write-verify-failed", verify: tverify, path: P.path, before: before, after: after });
+    }
+
+    return await commit({
+      ok: true, path: P.path, kind: "todo",
+      addedLines: addsNonBlank,
+      taskCountAfter: regionAfter.filter(function (s) { return s !== ""; }).length,
+      verify: tverify
+    }, after);
+  }
 
   const blocks = [];
   for (let i = 0; i < lines.length; i++) {
@@ -211,9 +395,15 @@ const WRITE_PAYLOAD = String.raw`
   const dup = blocks.find(function (b) { return bodyOf(b.body) === incoming; });
   if (dup) return JSON.stringify({ ok: true, status: "duplicate", path: P.path, id: dup.id, blockCount: blocks.length });
 
-  const block = ["<!-- jc:begin id=" + P.id + " -->", ""].concat(P.content.split(NL), ["", "<!-- jc:end id=" + P.id + " -->"]);
+  // 锚点是**纯追加**在正文最后一行末尾（不另起一行）：正文一个字节没动，
+  // bodyExact 仍按 P.content 找子串、恒命中。末不适合钉时 P.anchor 为空串（见 main 里的 tailAnchorBlocker）。
+  const anchoredContent = P.content + (P.anchor || "");
+  const block = ["<!-- jc:begin id=" + P.id + " -->", ""].concat(anchoredContent.split(NL), ["", "<!-- jc:end id=" + P.id + " -->"]);
 
-  const rawEnd = derived >= 0 ? derived : related;
+  const rawEndBase = derived >= 0 ? derived : related;
+  // 待办节是原文区与派生层之间多出来的一层。不把它算进来，新块就会拼到待办节**后面**，
+  // 而五项校验一条都拦不住（它们查「有没有弄坏已有内容」，不查「新内容放对没放对」）—— D25。
+  const rawEnd = todo >= 0 && todo < rawEndBase ? todo : rawEndBase;
   const rawBody = lines.slice(rawStart + 1, rawEnd);
 
   const insertion = [];
@@ -228,15 +418,20 @@ const WRITE_PAYLOAD = String.raw`
   const iEnd = tail.findIndex(function (l) { return idxEndRe.test(l); });
 
   // 分类列写成**裸标签**（不裹反引号），这样 Obsidian 才会把它当标签。
-  // 块 id 仍是不可读的 opaque id，继续裹反引号。
   const linkCell = P.links && P.links.length > 0 ? P.links : "\u2014";
-  const row = "| " + P.time + " | " + BT + P.id + BT + " | " + P.category + " | " + linkCell + " |";
+  // 块 id 列写成**块链接**（别名保留 id 文本，否则 Obsidian 渲染成「笔记 > 块 id」，
+  // 这一列会被撑得很长）：点一下跳回那段思考。
+  // 笔记名不能省 —— [[#^id]] 是同文档引用，行被剪到别的笔记里就哑了（与待办出处标记同口径）。
+  // 别名里的 | 必须逃成 \|，否则 markdown 会把它当成列分隔符（同关联列）。
+  const noteName = P.path.split("/").pop().replace(/\.md$/, "");
+  const idCell = "[[" + noteName + "#^" + P.id + "\\|" + P.id + "]]";
+  const row = "| " + P.time + " | " + idCell + " | " + P.category + " | " + linkCell + " |";
 
   if (derived >= 0 && iBegin >= 0 && iEnd > iBegin) {
     tail = tail.slice(0, iEnd).concat([row], tail.slice(iEnd));
   } else if (derived < 0) {
     if (iBegin >= 0 || iEnd >= 0) return JSON.stringify({ ok: false, error: "orphan-index-markers", path: P.path });
-    tail = [
+    const ins = [
       "## " + P.sections.derived,
       "",
       "<!-- jc:index:begin -->",
@@ -245,7 +440,11 @@ const WRITE_PAYLOAD = String.raw`
       row,
       "<!-- jc:index:end -->",
       ""
-    ].concat(tail);
+    ];
+    // 插在 ### 关联笔记 之前，**不是**拼在 tail 头上：待办节存在时 rawEnd 会提前到它那儿，
+    // 直接拼头会让 ## 今日分类与关联 插到 ## 今日待办 前面。待办节不存在时两者相等。
+    const at = related - rawEnd;
+    tail = tail.slice(0, at).concat(ins, tail.slice(at));
   } else {
     return JSON.stringify({ ok: false, error: "index-markers-missing", path: P.path });
   }
@@ -262,14 +461,28 @@ const WRITE_PAYLOAD = String.raw`
   }
   const originalsPreserved = sub === lines.length;
 
+  const newBeginLine = "<!-- jc:begin id=" + P.id + " -->";
+  const newEndLine = "<!-- jc:end id=" + P.id + " -->";
+  const newBeginAt = afterLines.indexOf(newBeginLine);
+  const newEndAt = afterLines.indexOf(newEndLine);
+  // 第 6 项校验（D25）：新块必须真的落在「今日的思考」这一节里 ——
+  // 它与 rawStart 之间不能再冒任何 H2（## 今日待办 / ## 今日分类与关联 都算越界）。
+  // 既有的五项全绿也能放错区，因为它们是内容守恒检查，不是位置检查。
+  let strayH2 = false;
+  for (let j = rawStart + 1; j < newBeginAt; j++) {
+    const h = head(afterLines[j]);
+    if (h && h.level <= 2) { strayH2 = true; break; }
+  }
+
   const verify = {
     marksBalanced: vBegin === vEnd,
     oneBlockAdded: vBegin === blocks.length + 1,
-    hasNewBlock: after.indexOf("<!-- jc:begin id=" + P.id + " -->") >= 0,
+    hasNewBlock: after.indexOf(newBeginLine) >= 0,
     bodyExact: P.content.length > 0 && after.indexOf(P.content) >= 0,
-    originalsPreserved: originalsPreserved
+    originalsPreserved: originalsPreserved,
+    blockInSection: newBeginAt > rawStart && newEndAt > newBeginAt && !strayH2
   };
-  verify.allOk = verify.marksBalanced && verify.oneBlockAdded && verify.hasNewBlock && verify.bodyExact && verify.originalsPreserved;
+  verify.allOk = verify.marksBalanced && verify.oneBlockAdded && verify.hasNewBlock && verify.bodyExact && verify.originalsPreserved && verify.blockInSection;
   if (!verify.allOk) {
     return JSON.stringify({ ok: false, error: "pre-write-verify-failed", verify: verify, path: P.path, before: before, after: after });
   }
@@ -279,34 +492,8 @@ const WRITE_PAYLOAD = String.raw`
     blockCountBefore: blocks.length, blockCountAfter: vBegin, verify: verify
   };
 
-  if (!P.write) {
-    base.status = "dry-run";
-    base.before = before;
-    base.after = after;
-    return JSON.stringify(base);
-  }
-
-  // 乐观并发：读取到写入之间若 Obsidian 那边改过，就原样返回、不落盘。
-  let concurrent = false;
-  await app.vault.process(file, function (data) {
-    if (data !== before) { concurrent = true; return data; }
-    return after;
-  });
-  if (concurrent) {
-    base.ok = false;
-    base.status = "concurrent-edit";
-    base.error = "concurrent-edit";
-    return JSON.stringify(base);
-  }
-  const readBack = await app.vault.read(file);
-  const readBackExact = readBack === after;
-  base.status = readBackExact ? "written" : "readback-mismatch";
-  base.ok = readBackExact;
-  base.readBackExact = readBackExact;
-  if (!readBackExact) base.readBack = readBack;
-  base.before = before;
-  base.after = after;
-  return JSON.stringify(base);
+  // 乐观并发与读回校验都在 commit 里（与待办通道共用，口径只有一处）。
+  return await commit(base, after);
 })()
 `;
 
@@ -386,6 +573,21 @@ const AUDIT_PAYLOAD = String.raw`
   const NL = "\n";
   const prefix = P.folder + "/";
   const rows = [];
+  // 与 Node 侧 splitUnescapedPipes 同一口径：\| 是格内字面管道，不是列分隔符。
+  // 硬 split("|") 会让块 id 列里的 \| 把列序号整体后移，cells[3] 就拿不到分类列 ——
+  // 那些行会被**悄悄丢掉**（不报错，只是结果少几行）。
+  const splitRowCells = function (s) {
+    const out = [];
+    let cur = "";
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charAt(i);
+      if (c === "\\" && s.charAt(i + 1) === "|") { cur += "\\|"; i++; continue; }
+      if (c === "|") { out.push(cur); cur = ""; continue; }
+      cur += c;
+    }
+    out.push(cur);
+    return out;
+  };
   const files = app.vault.getMarkdownFiles();
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
@@ -397,7 +599,7 @@ const AUDIT_PAYLOAD = String.raw`
     const text = await app.vault.read(f);
     const lines = text.split(NL);
     for (let j = 0; j < lines.length; j++) {
-      const cells = lines[j].split("|");
+      const cells = splitRowCells(lines[j]);
       if (cells.length < 5) continue;
       const tags = cells[3].split(/\s+/).filter(function (s) { return s.length > 0; });
       if (tags.indexOf(P.tag) < 0) continue;
@@ -573,13 +775,21 @@ function isTranspositionOnly(x, y) {
   return diff.length === 2 && diff[1] === diff[0] + 1 && x[diff[0]] === y[diff[1]] && x[diff[1]] === y[diff[0]];
 }
 
-function proofread(content, vocab, linkIndex, skipKinds) {
+function proofread(content, vocab, linkIndex, skipKinds, ctx) {
   const findings = [];
   const ranges = codeRanges(content);
   const lines = content.split("\n");
 
   if (content.trim() === "") {
     findings.push({ kind: "empty", severity: "high", autoFix: false, blocking: true, found: "(空)", suggestion: "", reason: "内容为空或只有空白，没有可写入的原文。" });
+  }
+
+  // 待办通道只跑 task-* 那一套（taskFindings 自带行尾空白之外的检查）：
+  // 通用的散文检查在任务行上全是噪音 —— 行内的 #gtd/next-action 会被当成英文词
+  // 报 ascii-case，就是个典型。两个口径分开，也便于 --skip 的语义看清楚。
+  if (CLI_ARGS.kind === "todo") {
+    for (const f of taskFindings(content, ctx)) findings.push(f);
+    return tallyFindings(content, findings, skipKinds);
   }
 
   // wikilink 区间：链接内部的内容（如 02-Done、[[spark]]）不该再被拆成英文单词
@@ -749,7 +959,11 @@ function proofread(content, vocab, linkIndex, skipKinds) {
     });
   }
 
-  // 8. 过滤 + 编号 + 严重度排序
+  // 8. 过滤 + 编号 + 严重度排序（两条通道共用，口径只有一处）
+  return tallyFindings(content, findings, skipKinds);
+}
+
+function tallyFindings(content, findings, skipKinds) {
   const kept = skipKinds && skipKinds.size > 0 ? findings.filter((f) => !skipKinds.has(f.kind)) : findings;
   const order = { high: 0, medium: 1, low: 2 };
   kept.sort((a, b) => (order[a.severity] - order[b.severity]) || ((a.start ?? -1) - (b.start ?? -1)));
@@ -764,7 +978,7 @@ function proofread(content, vocab, linkIndex, skipKinds) {
 //   - trailing-space / repeat-char：纯删除多余字符
 //   - ascii-case：只是大小写规范
 // 不含 ascii-typo：那是「改字」，必须显式确认。
-const SAFE_KINDS = new Set(["trailing-space", "repeat-char", "ascii-case"]);
+const SAFE_KINDS = new Set(["trailing-space", "repeat-char", "ascii-case", "task-date-format"]);
 
 function safeIds(findings) {
   return findings.filter((f) => f.autoFix && SAFE_KINDS.has(f.kind)).map((f) => f.id);
@@ -1199,6 +1413,33 @@ function suggestTags(content, tagList) {
 // D5 要求「不静默降级」，所以这一关必须在写盘前过；五项写盘校验只管**原文**，
 // 管不到派生层的分类列。
 const TAG_INVALID_CHARS = /[\s#,.;:!?()[\]{}|"']/;
+const TODO_TAG_RE = /(^|\s)#([^\s#,.;:!?()[\]{}|"'`，。、；：！？（）【】「」“”‘’]+)/g;
+// 待办行里的内联**主题**标签。Obsidian 的规则：`#` 前面必须是行首或空白（`a#b` 不是标签）。
+// `#gtd/*` 是任务状态，另有一套口径（由 `task-tag-unknown` 校对），**不**喂给 validateTags ——
+// D21/B4 要求两个口径分开；把待办行整行塞给 validateTags 会把 `#gtd/next-action` 判成非法新标签。
+// 另外两类在库里也不算主题标签，跳过而不是报错：纯数字（Obsidian 自己就不认 `#123`）与单字符噪声。
+function todoTopicTags(text) {
+  const seen = [];
+  for (const rawLine of String(text).split("\n")) {
+    const line = rawLine.replace(/`[^`]*`/g, ""); // 行内 code 里的 `#x` 不是标签
+    TODO_TAG_RE.lastIndex = 0;
+    let m;
+    while ((m = TODO_TAG_RE.exec(line)) !== null) {
+      const tag = "#" + m[2];
+      if (tagDropped(tag) !== null) continue; // gtd / numeric / short
+      if (seen.indexOf(tag) < 0) seen.push(tag);
+    }
+  }
+  return seen;
+}
+
+function knownTagSets(vocab) {
+  return {
+    skeleton: new Set(vocab.tags.filter((t) => t.source === "skeleton").map((t) => t.tag)),
+    live: new Set(vocab.tags.filter((t) => t.source === "vault").map((t) => t.tag)),
+  };
+}
+
 function validateTags(category, known) {
   const raw = String(category).trim();
   if (raw === "") return { ok: false, reason: "分类为空。" };
@@ -1237,12 +1478,238 @@ function validateTags(category, known) {
   return { ok: true, tags: toks, novel: novel };
 }
 
+function noteDateFromName(p) {
+  if (!p) return null;
+  const base = path.basename(String(p)).replace(/\.md$/, "");
+  const m = base.match(DAILY_BASENAME_RE);
+  return m ? m[1] + "-" + m[2] + "-" + m[3] : null;
+}
+
+function noteDateFromArgs(args) {
+  const fromPath = noteDateFromName(args && args.path);
+  if (fromPath) return fromPath;
+  if (typeof (args || {}).date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date)) return args.date;
+  return null;
+}
+
+// 库内实时存在的 #gtd/* 状态集。**不**从 registry 推：registry 里只有主题标签骨架，
+// 而 #gtd/* 是任务状态，两个口径分开（D21）。
+function loadGtdStatuses(vault, args) {
+  const code = "globalThis.__DJ_P = " + JSON.stringify({ roots: tagRoots(args) }) + ";\n" + TAGS_PAYLOAD;
+  const res = evalInObsidian(vault, code);
+  const out = [];
+  for (const t in res.tags) if (t.indexOf("#gtd/") === 0) out.push(t);
+  out.sort();
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 待办行校对（--kind=todo）
+//
+// 语法对齐库内的 obsidian-tasks-plugin（taskFormat = tasksPluginEmoji）。
+// 这一层只**报告**：除了 ➕（D22），一切修正都要用户点头。
+// ---------------------------------------------------------------------------
+
+const TASK_LINE_RE = /^([ \t]*)([-*+])[ \t]+\[(.)\]/;
+const TASK_STATUSES = [" ", "x", "/", "-"];
+const TASK_PRIORITY_ORDER = ["🔺", "⏫", "🔼", "🔽"];
+const TASK_FIELD_ORDER = ["➕", "🛫", "⏳", "📅", "🔁", "✅", "❌"];
+const TASK_DATE_FIELDS = ["➕", "🛫", "⏳", "📅", "✅", "❌"];
+const TASK_FIELD_RE = /(➕|🛫|⏳|📅|🔁|✅|❌)[ \t]*([^ \t]*)/g;
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const RELATIVE_DAY_RE = /(今天|明天|后天|大后天|昨天|前天|今晚|明晚|今早|明早|这周|本周|下周|上周|周末|这月|本月|下月|上个月|月底|月初|年底)/;
+const RELATIVE_OFFSET_RE = /([0-9]+|[一二三四五六七八九十两]+)[ \t]*(天|周|个?月|年)(前|后|内|以内|以后|之后)/;
+const RELATIVE_WEEKDAY_RE = /(下周|本周|这周|上周|周|星期|礼拜)[一二三四五六日天]/;
+const WEEKDAY_NUM = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 0, "天": 0 };
+const DAY_OFFSET = { "今天": 0, "今早": 0, "今晚": 0, "明天": 1, "明早": 1, "明晚": 1, "后天": 2, "大后天": 3, "昨天": -1, "前天": -2 };
+const CN_NUM = { "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10 };
+
+function ymdOf(d) {
+  return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+}
+
+// 相对时间只**建议**，绝不自动落盘（D24）。给出的值要用户点头后用 --fix-pair 应用，
+// 所以这里只是一个提示字符串，不存在“静默替你决定”的路径。
+function suggestAbsoluteDate(token, noteDate) {
+  if (!noteDate) return null;
+  const base = new Date(noteDate + "T00:00:00");
+  if (isNaN(base.getTime())) return null;
+  const shift = (n) => { const d = new Date(base.getTime()); d.setDate(d.getDate() + n); return ymdOf(d); };
+
+  if (Object.prototype.hasOwnProperty.call(DAY_OFFSET, token)) return shift(DAY_OFFSET[token]);
+
+  const wd = token.match(/(下周|本周|这周|上周)?(?:周|星期|礼拜)([一二三四五六日天])$/);
+  if (wd) {
+    const raw = WEEKDAY_NUM[wd[2]] - base.getDay();
+    if (wd[1] === "下周") return shift(raw + 7);
+    if (wd[1] === "上周") return shift(raw - 7);
+    return shift(raw);
+  }
+
+  const off = token.match(/^([0-9]+|[一二三四五六七八九十两]+)[ \t]*(天|周|个?月|年)(前|后|内|以内|以后|之后)$/);
+  if (!off) return null;
+  const n = /^[0-9]+$/.test(off[1]) ? Number(off[1]) : (Object.prototype.hasOwnProperty.call(CN_NUM, off[1]) ? CN_NUM[off[1]] : null);
+  if (n === null) return null;
+  const sign = off[3] === "前" ? -1 : 1;
+  if (off[2] === "天") return shift(sign * n);
+  if (off[2] === "周") return shift(sign * n * 7);
+  const d = new Date(base.getTime());
+  if (off[2] === "年") d.setFullYear(d.getFullYear() + sign * n);
+  else d.setMonth(d.getMonth() + sign * n);
+  return ymdOf(d);
+}
+
+function taskFindings(content, ctx) {
+  const out = [];
+  const lines = content.split("\n");
+  const starts = [];
+  let acc = 0;
+  for (let i = 0; i < lines.length; i++) { starts.push(acc); acc += lines[i].length + 1; }
+  const gtd = (ctx && ctx.gtd) || null;
+  const noteDate = (ctx && ctx.noteDate) || null;
+  const indentChars = new Set();
+
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() === "") continue;
+    const lead = l.match(/^[ \t]*/)[0];
+    const at = starts[i];
+    const m = l.match(TASK_LINE_RE);
+
+    if (lead.length > 0) indentChars.add(lead.charAt(0));
+
+    if (!m) {
+      // 缩进行当子项/续行，允许；顶格的必须是一行 checkbox。
+      if (lead.length === 0) {
+        out.push({
+          kind: "task-no-checkbox", severity: "high", autoFix: false, blocking: true,
+          line: i + 1, start: at, end: at + l.length, found: l,
+          suggestion: "- [ ] " + l,
+          reason: "待办捕获里顶格的行必须是一行 checkbox（- [ ]），这一行不是。",
+        });
+      }
+      continue;
+    }
+
+    const status = m[3];
+    if (TASK_STATUSES.indexOf(status) < 0) {
+      out.push({
+        kind: "task-status-unknown", severity: "high", autoFix: false, blocking: true,
+        line: i + 1, start: at + m[0].length - 2, end: at + m[0].length - 1,
+        found: "[" + status + "]",
+        suggestion: "[ ]（待办）或 [x]（完成）",
+        reason: "状态符 " + JSON.stringify(status) + " 不在库内 tasks 插件认的四种（空格 / x / / / -）里。",
+      });
+    }
+
+    const rest = l.slice(m[0].length);
+    const restAt = at + m[0].length;
+
+    // 字段顺序：乱序会让顶上按 #gtd/wait-for 分组、按 ⏳/📅 取日期的查询漏掉这一行。
+    const seq = [];
+    const fields = [];
+    for (const p of TASK_PRIORITY_ORDER) {
+      const idx = rest.indexOf(p);
+      if (idx >= 0) seq.push({ pos: idx, token: p, rank: 0 });
+    }
+    TASK_FIELD_RE.lastIndex = 0;
+    let fm;
+    while ((fm = TASK_FIELD_RE.exec(rest))) {
+      fields.push({ token: fm[1], value: fm[2], pos: fm.index, len: fm[0].length });
+      seq.push({ pos: fm.index, token: fm[1], rank: TASK_FIELD_ORDER.indexOf(fm[1]) + 1 });
+    }
+    seq.sort((a, b) => a.pos - b.pos);
+    for (let k = 1; k < seq.length; k++) {
+      if (seq[k].rank < seq[k - 1].rank) {
+        out.push({
+          kind: "task-field-order", severity: "medium", autoFix: false, blocking: false,
+          line: i + 1, start: restAt + seq[k - 1].pos, end: restAt + seq[k].pos + 1,
+          found: seq[k - 1].token + " 在 " + seq[k].token + " 之前",
+          suggestion: "字段顺序：描述 → 标签 → 优先级 → ➕ → 🛫 → ⏳ → 📅 → 🔁 → ✅/❌",
+          reason: "emoji 字段顺序乱了，顶上按 #gtd/wait-for 分组与众日期查询会漏掉这一行。",
+        });
+        break;
+      }
+    }
+
+    // 日期字段的格式：一律 YYYY-MM-DD
+    for (const f of fields) {
+      if (TASK_DATE_FIELDS.indexOf(f.token) < 0) continue;
+      if (f.value === "" || ISO_DATE_RE.test(f.value)) continue;
+      const span = { start: restAt + f.pos, end: restAt + f.pos + f.len };
+      const g = f.value.match(/^(\d{4})[/.](\d{1,2})[/.](\d{1,2})$/);
+      if (g) {
+        const iso = g[1] + "-" + pad2(g[2]) + "-" + pad2(g[3]);
+        out.push(Object.assign({
+          kind: "task-date-format", severity: "medium", autoFix: true, blocking: false,
+          line: i + 1, replace: f.token + " " + iso,
+          found: f.token + " " + f.value, suggestion: f.token + " " + iso,
+          reason: "日期一律写 YYYY-MM-DD：库内所有 tasks 查询都按这个格式比。",
+        }, span));
+      } else {
+        out.push(Object.assign({
+          kind: "task-date-format", severity: "medium", autoFix: false, blocking: false,
+          line: i + 1, found: f.token + " " + f.value,
+          suggestion: f.token + " YYYY-MM-DD",
+          reason: "日期一律写 YYYY-MM-DD；" + JSON.stringify(f.value) + " 缺年份，脚本不替你猜。",
+        }, span));
+      }
+    }
+
+    // 相对时间（D24）
+    let rel = null;
+    const d1 = rest.match(RELATIVE_DAY_RE);
+    if (d1) rel = d1[0];
+    if (!rel) { const d2 = rest.match(RELATIVE_WEEKDAY_RE); if (d2) rel = d2[0]; }
+    if (!rel) { const d3 = rest.match(RELATIVE_OFFSET_RE); if (d3) rel = d3[0]; }
+    if (rel) {
+      const guess = suggestAbsoluteDate(rel, noteDate);
+      out.push({
+        kind: "task-date-relative", severity: "medium", autoFix: false, blocking: true,
+        line: i + 1, start: restAt, end: restAt + rest.length, found: rel,
+        suggestion: guess
+          ? "改为 " + guess + "；用 --fix-pair 落地，右值要带够上下文（如 '明天去取车→2026-09-21 去取车'），" +
+            "别只替「" + rel + "」一个词（会变成 '2026-09-21去取车'）"
+          : "改成 YYYY-MM-DD（要用户点头）",
+        reason: "相对时间不落盘：跨周 / 跨月 / 跨年时有真歧义，错一天任务就在错的日子冒出来（D24）。",
+      });
+    }
+
+    // #gtd/* 状态：库内没有的就是新状态，得先问用户（与主题标签同一个纪律，但两套词表）
+    if (gtd) {
+      const found = rest.match(/#gtd(?:\/[^\s#]+)?/g) || [];
+      for (const t of found) {
+        if (gtd.indexOf(t) >= 0) continue;
+        out.push({
+          kind: "task-tag-unknown", severity: "medium", autoFix: false, blocking: false,
+          line: i + 1, start: restAt, end: restAt + rest.length, found: t,
+          suggestion: gtd.length > 0 ? gtd.join(" / ") : "先确认库里要用哪个状态",
+          reason: "库内没有 " + t + " 这个 gtd 状态（它是任务状态，不是主题标签）。",
+        });
+      }
+    }
+  }
+
+  if (indentChars.has("\t") && indentChars.has(" ")) {
+    out.push({
+      kind: "task-indent-mixed", severity: "low", autoFix: false, blocking: false,
+      found: "Tab 与空格混用",
+      suggestion: "统一成 Tab（库内已有的任务子项用的是 Tab）",
+      reason: "同一个块内缩进不能混用 Tab 和空格，Obsidian 会把它们算成不同层级。",
+    });
+  }
+
+  return out;
+}
+
 function runProofread(vault, content, skipKinds) {
   const registry = loadRegistry(vault);
   const listed = listFiles(vault);
   const vocab = buildVocabulary(registry);
   const linkIndex = buildLinkIndex(listed);
-  return proofread(content, vocab, linkIndex, skipKinds);
+  const ctx = { gtd: null, noteDate: noteDateFromArgs(CLI_ARGS) };
+  if (CLI_ARGS.kind === "todo") ctx.gtd = loadGtdStatuses(vault, CLI_ARGS);
+  return proofread(content, vocab, linkIndex, skipKinds, ctx);
 }
 
 function readContent(args) {
@@ -1299,6 +1766,22 @@ const FIXWRITTEN_PAYLOAD = String.raw`
   const P = globalThis.__DJ_P;
   const f = app.vault.getAbstractFileByPath(P.path);
   if (!f) return JSON.stringify({ ok: false, error: "file-missing", path: P.path });
+  const sumOf = function (s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return h;
+  };
+  // 落盘前先拿 Node 算的 len/sum 自查：载荷在传输路上被改写就一个字都不写。
+  // 光比对字符串不够——两边一起被改坏时字符串照样相等（见 escapeNonAsciiForCli 注释）。
+  if (P.after.length !== P.afterLen || sumOf(P.after) !== P.afterSum) {
+    return JSON.stringify({
+      ok: false,
+      error: "transport-corrupt",
+      path: P.path,
+      gotLen: P.after.length,
+      wantLen: P.afterLen
+    });
+  }
   let seen = "";
   await app.vault.process(f, (data) => {
     seen = data;
@@ -1311,10 +1794,72 @@ const FIXWRITTEN_PAYLOAD = String.raw`
     path: P.path,
     beforeMatched: seen === P.expectBefore,
     written: seen === P.expectBefore,
-    readBackExact: after === P.after
+    readBackExact: after === P.after,
+    readBackSumOk: after.length === P.afterLen && sumOf(after) === P.afterSum
   });
 })()
 `;
+
+// 内容指纹：落盘前自查用（跟 Obsidian 侧同一套 31 进制滚动和）。
+// 只防传输/落盘路上被改写，不当身份标识用。
+function contentStamp(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return { len: s.length, sum: h };
+}
+
+// 捕获通道的指纹域：字段顺序与 WRITE_PAYLOAD 里的 stampSrc 必须逐字对应。
+// join 会把 undefined / null 归一成空串，所以两侧算法一致。
+function captureStampSrc(p) {
+  return [
+    p.content,
+    p.anchor,
+    p.id,
+    p.time,
+    p.noteDate,
+    p.createdDateSource,
+    p.category,
+    p.links,
+    p.sections.thinking,
+    p.sections.todo,
+    p.sections.derived,
+    p.sections.related,
+  ].join("\u0000");
+}
+
+// 所有改写落盘都走这里：一次落盘前比对 + 一次回读校验，六个调用点不再各写一遍。
+function writeNoteInObsidian(vault, p) {
+  const st = contentStamp(p.after);
+  const res = evalInObsidian(
+    vault,
+    "globalThis.__DJ_P = " +
+      JSON.stringify({
+        path: p.rel,
+        expectBefore: p.expectBefore,
+        after: p.after,
+        afterLen: st.len,
+        afterSum: st.sum
+      }) +
+      ";\n" +
+      FIXWRITTEN_PAYLOAD
+  );
+  if (!res.ok && res.error === "transport-corrupt") {
+    fail(
+      "落盘前自查不过 " + p.rel + "：待写内容在传进 Obsidian 的路上被改过（长度 " +
+        res.gotLen + "，应为 " + res.wantLen + "），已中止、一个字未写。\n" +
+        "  这是 obsidian CLI 的 code= 入参的已知失真；本脚本已把非 ASCII 转义送出，\n" +
+        "  仍出现请升级 CLI，并把这条记入 decision-log。"
+    );
+  }
+  if (!res.ok) fail("落盘失败 " + p.rel + "：" + res.error);
+  if (!res.beforeMatched) {
+    fail("落盘前比对失败 " + p.rel + "：文件在读取后被改过，未写入（concurrent-edit）");
+  }
+  if (!res.readBackExact || !res.readBackSumOk) {
+    fail("回读不一致 " + p.rel + "：写入未按预期生效。备份在 " + (p.backup || ""));
+  }
+  return res;
+}
 
 function parseReplaceList(spec, flag = "--replace") {
   if (typeof spec !== "string" || spec.trim() === "") {
@@ -1435,26 +1980,30 @@ function cmdFixWritten(vault, args) {
       }
 
       const oldId = id;
-      const newHash = crypto.createHash("sha1").update(newBody, "utf8").digest("hex").slice(0, 4);
+      // 锚点不算正文：算 hash 前先剥掉，否则锚点里的旧 id 会自指进新 hash。
+      const canonNew = stripTailAnchor(newBody);
+      const newHash = crypto.createHash("sha1").update(canonNew, "utf8").digest("hex").slice(0, 4);
       const newId = id.slice(0, id.length - 5) + "-" + newHash;
+      // 锚点是 id 的副本，id 换了它就得跟着换。本来没有锚点的旧块不补 ——
+      // 借「改错字」顺手给别人的笔记换形状是另一件事，要另开通道。
+      const anchoredNew = canonNew === newBody ? canonNew : canonNew + " ^" + newId;
 
       after =
         after.slice(0, sp.bStart) +
         "<!-- jc:begin id=" + newId + " -->\n\n" +
-        newBody +
+        anchoredNew +
         "\n\n<!-- jc:end id=" + newId + " -->" +
         after.slice(sp.eEnd);
 
-      changed.push({ id: oldId, newId: newId, hits: hits, before: oldBody, after: newBody });
-      reports.push({ id: oldId, newId: newId, path: rel, hits: hits, before: oldBody, after: newBody });
+      changed.push({ id: oldId, newId: newId, hits: hits, before: oldBody, after: anchoredNew });
+      reports.push({ id: oldId, newId: newId, path: rel, hits: hits, before: oldBody, after: anchoredNew });
     }
 
     if (changed.length === 0) continue;
 
-    // 索引行里的 id 一起换（旧格式裹反引号，新格式也是）
-    for (const c of changed) {
-      after = replaceAllText(after, "`" + c.id + "`", "`" + c.newId + "`");
-    }
+    // 索引行里的 id 一起换（形态无关，旧的反引号与新的块链接都认）。
+    // 只碰索引行那一格：jt 区里用户手写的来源链接不动（那是另一层、另一件事）。
+    after = remapIndexRowIds(after, changed.map((c) => ({ from: c.id, to: c.newId })));
 
     // 块外必须逐字节不变：把块内替换全部还原后，应正好等于原文
     let restored = after;
@@ -1462,8 +2011,8 @@ function cmdFixWritten(vault, args) {
       restored = replaceAllText(restored, c.after, c.before);
       restored = replaceAllText(restored, "<!-- jc:begin id=" + c.newId + " -->", "<!-- jc:begin id=" + c.id + " -->");
       restored = replaceAllText(restored, "<!-- jc:end id=" + c.newId + " -->", "<!-- jc:end id=" + c.id + " -->");
-      restored = replaceAllText(restored, "`" + c.newId + "`", "`" + c.id + "`");
     }
+    restored = remapIndexRowIds(restored, changed.map((c) => ({ from: c.newId, to: c.id })));
     const outsideUntouched = restored === content;
 
     plans.push({ rel: rel, expectBefore: content, after: after, outsideUntouched: outsideUntouched, changed: changed });
@@ -1513,13 +2062,7 @@ function cmdFixWritten(vault, args) {
 
   const written = [];
   for (const p of plans) {
-    const res = evalInObsidian(
-      vault,
-      "globalThis.__DJ_P = " + JSON.stringify({ path: p.rel, expectBefore: p.expectBefore, after: p.after }) + ";\n" + FIXWRITTEN_PAYLOAD,
-    );
-    if (!res.ok) fail("落盘失败 " + p.rel + "：" + res.error);
-    if (!res.beforeMatched) fail("落盘前比对失败 " + p.rel + "：文件在读取后被改过，未写入（readback-mismatch）");
-    if (!res.readBackExact) fail("回读不一致 " + p.rel + "：写入未按预期生效。备份在 " + p.backup);
+    writeNoteInObsidian(vault, p);
     written.push({ path: p.rel, backup: p.backup, changed: p.changed.length });
   }
 
@@ -1534,6 +2077,159 @@ function cmdFixWritten(vault, args) {
       process.stdout.write("  " + r.id + " -> " + r.newId + "  " + r.hits.map((h) => h.from + "→" + h.to).join("、") + "\n");
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// --repair-text：修 jc 块**之外**已写下的机械错误（错字、模板片段被改坏）。
+//
+// 块内正文不走这里：那边的块 id 是正文 sha1 的派生物，改字必须连带换 id，
+// 属于 --fix-written 的地盘。这里只做「块外一处字面替换」，三条规定：
+//   1. 每对必须且只能命中一次（宁少勿多，命中 0 或 >1 都拒绝）；
+//   2. 命中处不许落在任何 jc 块体内（否则请改用 --fix-written）；
+//   3. 反向回代必须逐字节回到原文 —— 「除了这一处，什么都没动」的硬证据。
+// ---------------------------------------------------------------------------
+
+const REPAIR_READ_PAYLOAD = String.raw`
+(async () => {
+  const P = globalThis.__DJ_P;
+  let f = app.vault.getAbstractFileByPath(P.path);
+  let resolved = P.path;
+  if (!f) {
+    const hits = app.vault.getMarkdownFiles().filter(function (x) { return x.name === P.path || x.basename === P.path; });
+    if (hits.length === 1) { f = hits[0]; resolved = f.path; }
+    else if (hits.length > 1) return JSON.stringify({ ok: false, error: "path-ambiguous", matches: hits.map(function (x) { return x.path; }) });
+  }
+  if (!f) return JSON.stringify({ ok: false, error: "file-missing", path: P.path });
+  return JSON.stringify({ ok: true, path: f.path, content: await app.vault.read(f), root: app.vault.adapter.basePath });
+})()
+`;
+
+// 命中位置是否落在某个 jc 块体内（块体 = begin 标记结束 到 end 标记开始之间）
+function jcBodySpans(content) {
+  const begins = [];
+  const ends = [];
+  const re = /<!-- jc:(begin|end)(?: id=[^ ]*)? -->/g;
+  let m;
+  while ((m = re.exec(content)) !== null) {
+    (m[1] === "begin" ? begins : ends).push({ start: m.index, end: m.index + m[0].length });
+  }
+  if (begins.length !== ends.length) return null; // 标记不成对
+  const spans = [];
+  for (let i = 0; i < begins.length; i++) spans.push([begins[i].end, ends[i].start]);
+  return spans;
+}
+
+function cmdRepairText(vault, args) {
+  if (typeof args.path !== "string" || args.path === "") {
+    fail("--repair-text 需要 --path=<路径|文件名>（只修这一个文件）");
+  }
+  let pairs;
+  try {
+    pairs = parseReplaceList(args.replace, "--replace");
+  } catch (e) {
+    fail(String((e && e.message) || e));
+  }
+  if (pairs.length === 0) fail("--repair-text 需要 --replace='错→对'");
+  for (const p of pairs) {
+    if (p.from.indexOf("\n") >= 0 || p.to.indexOf("\n") >= 0) {
+      fail("这个通道只修一行之内的字面错字：--replace 的左边和右边都不能含换行");
+    }
+  }
+
+  const rr = evalInObsidian(
+    vault,
+    "globalThis.__DJ_P = " + JSON.stringify({ path: args.path }) + ";\n" + REPAIR_READ_PAYLOAD,
+  );
+  if (!rr.ok && rr.error === "path-ambiguous") {
+    fail("这个文件名在库里有多个，请给全路径：\n  " + rr.matches.join("\n  "));
+  }
+  if (!rr.ok) fail("读不到 " + args.path + "：" + rr.error);
+  const before = rr.content;
+  const spans = jcBodySpans(before);
+  if (!spans) fail("jc 标记不成对：" + rr.path + "（orphan-index-markers），先修标记再改字");
+
+  let after = before;
+  const hits = [];
+  for (const p of pairs) {
+    const n = countOf(after, p.from);
+    if (n === 0) fail("没命中：「" + p.from + "」在 " + rr.path + " 里找不到（一个字也未改）");
+    if (n > 1) {
+      fail(
+        "命中 " + n + " 次，不止一处：「" + p.from + "」\n" +
+          "  这个通道只修一处，请把 --replace 的左边加长到全文件唯一（一个字也未改）",
+      );
+    }
+    const at = after.indexOf(p.from);
+    for (const [s, e] of spans) {
+      if (at >= s && at < e) {
+        fail(
+          "命中落在 jc 块体内（偏移 " + at + "）：" + rr.path + "\n" +
+            "  块内正文有 id 一致性约束，请改用 --fix-written --id=<块 id> --replace='错→对'",
+        );
+      }
+    }
+    hits.push({ from: p.from, to: p.to, at: at, line: before.slice(0, at).split("\n").length });
+    after = replaceAllText(after, p.from, p.to);
+  }
+
+  // 反向回代：倒序撤销，逐字节回到原文
+  let back = after;
+  for (let i = hits.length - 1; i >= 0; i--) back = replaceAllText(back, hits[i].to, hits[i].from);
+  if (back !== before) {
+    fail(
+      "回代校验失败：" + rr.path + "\n" +
+        "  替换不是干净的字面替换（右值在原文中也出现过，会互相干扰）。请换更长的上下文再试。",
+    );
+  }
+
+  // 只允许命中处的字节不同：把命中处（左值版/右值版）都挖成同一个哨兵后，两边必须完全相等
+  const SENT = "\u0000";
+  if (before.indexOf(SENT) >= 0) fail("原文里有 NUL 字符，本通道不能用，已中止未落盘");
+  let a2 = before;
+  let a3 = after;
+  for (const h of hits) {
+    a2 = replaceAllText(a2, h.from, SENT);
+    a3 = replaceAllText(a3, h.to, SENT);
+  }
+  if (a2 !== a3) fail("命中处之外还有别的字节不同（脚本 bug），已中止未落盘");
+
+  const lineOf = (i) => before.slice(0, i).split("\n").length;
+  const lineText = (s, i) => (s.split("\n")[lineOf(i) - 1] || "").trim();
+  const rows = hits.map((h) => ({
+    line: h.line,
+    from: h.from,
+    to: h.to,
+    before: lineText(before, h.at),
+    after: lineText(after, h.at),
+  }));
+
+  if (!args.write) {
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ok: true, status: "dry-run", path: rr.path, rows: rows }, null, 2) + "\n");
+      return;
+    }
+    process.stdout.write("修复 " + rr.path + "\n");
+    for (const r of rows) {
+      process.stdout.write("  行 " + r.line + "\n      「" + r.before + "」\n      → 「" + r.after + "」\n");
+    }
+    process.stdout.write("\n只改这一处，其余字节不动；jc 块体内的正文一个字节不动。确认后加 --write 重跑。\n");
+    return;
+  }
+
+  const bdir = path.join(rr.root, ".daily-journal", "backup");
+  fs.mkdirSync(bdir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backup = path.join(bdir, path.basename(rr.path) + "." + stamp + ".bak");
+  fs.writeFileSync(backup, before);
+  writeNoteInObsidian(vault, { rel: rr.path, expectBefore: before, after: after, backup: backup });
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify({ ok: true, status: "written", path: rr.path, backup: backup, rows: rows }, null, 2) + "\n");
+    return;
+  }
+  process.stdout.write("修复完成\n");
+  for (const r of rows) process.stdout.write("  " + rr.path + "  行 " + r.line + "  「" + r.from + "」→「" + r.to + "」\n");
+  process.stdout.write("  备份: " + backup + "\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,17 +2256,66 @@ const MIGRATE_LIST_PAYLOAD = String.raw`
 
 const BT_CHAR = String.fromCharCode(96);
 
+// 按**未转义**的 | 拆单元格。关联列与块 id 列里的 \| 是格内字面管道（markdown 表格要求），
+// 不是列分隔符 —— 拿 split("|") 硬拆会把列序号整体后移。
+function splitUnescapedPipes(s) {
+  const out = [];
+  let cur = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charAt(i);
+    if (c === "\\" && s.charAt(i + 1) === "|") { cur += "\\|"; i++; continue; }
+    if (c === "|") { out.push(cur); cur = ""; continue; }
+    cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+// 「块 id」单元格有两种形态：
+//   旧：`20260916-1547-8c95`                裹反引号（历史笔记里还留着）
+//   新：[[2026-09-38w-20#^2026…-8c95\|…]]   块链接，点一下跳回那段思考
+// 读的时候两种都认，写的时候只写新形态。
+const INDEX_ID_LEGACY_RE = /^\d{8}-\d{4}-[0-9a-f]{4}$/;
+const INDEX_ID_LINK_RE = /^\[\[[^\[\]|#]+#\^(\d{8}-\d{4}-[0-9a-f]{4})(?:\\\|[^\]]*)?\]\]$/;
+
+function indexCellId(cell) {
+  const s = String(cell);
+  const m = s.match(INDEX_ID_LINK_RE);
+  if (m) return m[1];
+  if (s.length >= 3 && s.charAt(0) === BT_CHAR && s.charAt(s.length - 1) === BT_CHAR) {
+    const inner = s.slice(1, -1);
+    if (INDEX_ID_LEGACY_RE.test(inner)) return inner;
+  }
+  return null;
+}
+
 // 索引行 = "| 时间 | 块 id | 分类 | 关联 |"
 function splitIndexRow(line) {
   if (line.charAt(0) !== "|" || line.charAt(line.length - 1) !== "|") return null;
-  const parts = line.slice(1, -1).split("|").map((s) => s.trim());
+  const parts = splitUnescapedPipes(line.slice(1, -1)).map((s) => s.trim());
   if (parts.length !== 4) return null;
   if (!/^\d{2}:\d{2}$/.test(parts[0])) return null;
-  if (parts[1].length < 3 || parts[1].charAt(0) !== BT_CHAR || parts[1].charAt(parts[1].length - 1) !== BT_CHAR) return null;
+  if (indexCellId(parts[1]) === null) return null;
   return parts;
 }
 
-// 只认「每一段都裘了反引号」的旧格式；混写（已经是裸标签）直接返回 null，不动它
+// 换 id 时**只动「块 id」那一格**：形态无关（反引号与块链接都认），格内那串 id 出现两次
+// （锚点与别名），一次换掉；同一行其余字节一个不动（不重排版，回代证明才守得住）。
+// 只认索引行 —— jt 区里用户手写的 [[…#^id|↩]] 是另一层，不在这里改。
+function remapIndexRowIds(text, pairs) {
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const parts = splitIndexRow(lines[i]);
+    if (!parts) continue;
+    const cur = indexCellId(parts[1]);
+    for (const p of pairs) {
+      if (p.from === cur) { lines[i] = replaceAllText(lines[i], p.from, p.to); break; }
+    }
+  }
+  return lines.join("\n");
+}
+
+// 只认「每一段都裹了反引号」的旧格式；混写（已经是裸标签）直接返回 null，不动它
 function unwrapLegacyCategory(cat) {
   const toks = cat.split(/\s+/).filter(Boolean);
   if (toks.length === 0) return null;
@@ -1636,7 +2381,7 @@ function cmdMigrateTags(vault, args) {
 
       lines[i] = "| " + parts[0] + " | " + parts[1] + " | " + tags.join(" ") + " | " + parts[3] + " |";
       touched = true;
-      rows.push({ path: f.path, line: i + 1, id: parts[1].slice(1, -1), from: parts[2], to: tags.join(" ") });
+      rows.push({ path: f.path, line: i + 1, id: indexCellId(parts[1]) || parts[1], from: parts[2], to: tags.join(" ") });
     }
     if (touched) plans.push({ rel: f.path, expectBefore: f.content, after: lines.join("\n") });
   }
@@ -1665,13 +2410,7 @@ function cmdMigrateTags(vault, args) {
     const b = path.join(bdir, path.basename(p.rel) + "." + stamp + ".bak");
     fs.writeFileSync(b, p.expectBefore);
     p.backup = b;
-    const res = evalInObsidian(
-      vault,
-      "globalThis.__DJ_P = " + JSON.stringify({ path: p.rel, expectBefore: p.expectBefore, after: p.after }) + ";\n" + FIXWRITTEN_PAYLOAD,
-    );
-    if (!res.ok) fail("落盘失败 " + p.rel + "：" + res.error);
-    if (!res.beforeMatched) fail("落盘前比对失败 " + p.rel + "：文件在读取后被改过，未写入");
-    if (!res.readBackExact) fail("回读不一致 " + p.rel + "：备份在 " + p.backup);
+    writeNoteInObsidian(vault, p);
   }
 
   if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "written", rows: rows }, null, 2) + "\n");
@@ -1679,6 +2418,148 @@ function cmdMigrateTags(vault, args) {
     process.stdout.write("迁移完成：" + rows.length + " 行\n\n");
     for (const r of rows) process.stdout.write("  " + r.path + ":" + r.line + "  " + r.from + "  →  " + r.to + "\n");
     for (const p of plans) process.stdout.write("  备份: " + p.backup + "\n");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// --link-block-ids：把派生层里裹反引号的「块 id」格改写成块链接
+//
+//     | 10:25 | [[2026-09-38w-20#^20260920-1025-e95b\|20260920-1025-e95b]] | #family | — |
+//
+// 为什么要有这条通道：捕获通道从此直接写链接，但**历史笔记里还是反引号形态**。
+// 形态迁移不回去改，那些行的 id 就永远点不动。
+// 三条约束：
+//   1. 只动派生层索引行的 id 那**一个格**（换回去必须逐字节等于原行）；
+//   2. 块必须真的在本文件里（找不到就报 block-missing，不写）；
+//   3. 块必须已经有尾部锚点 —— 没锚点链接就跳不过去。这里**不代劳补锚点**，
+//      只报 anchor-missing 让你先跑 --add-anchors（两件事分开，各自可核）。
+// ---------------------------------------------------------------------------
+
+function cmdLinkBlockIds(vault, args) {
+  const dp = dailyPath(vault);
+  const slash = dp.lastIndexOf("/");
+  const folder = slash > 0 ? dp.slice(0, slash) : "";
+  if (folder === "") fail("定位不到日记目录（daily:path = " + dp + "）");
+  const listed = evalInObsidian(
+    vault,
+    "globalThis.__DJ_P = " + JSON.stringify({ folder: folder }) + ";\n" + MIGRATE_LIST_PAYLOAD,
+  );
+
+  const rows = [];
+  const skipped = [];
+  const plans = [];
+  for (const f of listed.files) {
+    const noteName = path.basename(f.path).replace(/\.md$/, "");
+    const lines = f.content.split("\n");
+    const touched = [];
+    for (let i = 0; i < lines.length; i++) {
+      const parts = splitIndexRow(lines[i]);
+      if (!parts) continue;
+      const id = indexCellId(parts[1]);
+      if (id === null) continue;
+      if (parts[1].charAt(0) === "[") continue; // 已经是链接形态
+
+      const cell = BT_CHAR + id + BT_CHAR;
+      if (lines[i].indexOf(cell) < 0) {
+        skipped.push({ path: f.path, line: i + 1, id: id, reason: "id 格不是纯反引号形态" });
+        continue;
+      }
+
+      const beginLine = "<!-- jc:begin id=" + id + " -->";
+      const endLine = "<!-- jc:end id=" + id + " -->";
+      const b = lines.indexOf(beginLine);
+      if (b < 0) {
+        skipped.push({ path: f.path, line: i + 1, id: id, reason: "block-missing（本文件里没有这个块）" });
+        continue;
+      }
+      let e = -1;
+      for (let k = b + 1; k < lines.length; k++) {
+        if (lines[k] === endLine) { e = k; break; }
+      }
+      if (e < 0) {
+        skipped.push({ path: f.path, line: i + 1, id: id, reason: "end 标记缺失（先跑 --verify-ids）" });
+        continue;
+      }
+      let anchored = false;
+      for (let k = b + 1; k < e; k++) {
+        if ((lines[k].match(/ \^([A-Za-z0-9._-]+)$/) || [])[1] === id) { anchored = true; break; }
+      }
+      if (!anchored) {
+        skipped.push({ path: f.path, line: i + 1, id: id, reason: "anchor-missing（先跑 --add-anchors）" });
+        continue;
+      }
+
+      const link = "[[" + noteName + "#^" + id + "\\|" + id + "]]";
+      const newLine = replaceAllText(lines[i], cell, link);
+      // 只动这一格：把链接换回去必须逐字节等于原行
+      if (replaceAllText(newLine, link, cell) !== lines[i]) {
+        fail("回代校验失败：" + f.path + ":" + (i + 1) + "（一个字未写）");
+      }
+      lines[i] = newLine;
+      touched.push({ path: f.path, line: i + 1, id: id, from: cell, to: link });
+    }
+
+    if (touched.length === 0) continue;
+    const after = lines.join("\n");
+    // 全文件回代：把每一处都换回去，应正好等于原文（「除了这些格，什么都没动」的硬证据）
+    let restored = after;
+    for (const t of touched) restored = replaceAllText(restored, t.to, t.from);
+    if (restored !== f.content) {
+      fail("块外内容被牵连：" + f.path + "\n  这是脚本的 bug，已中止未落盘。请把现场报给用户看。");
+    }
+    for (const t of touched) rows.push(t);
+    plans.push({ rel: f.path, expectBefore: f.content, after: after });
+  }
+
+  if (rows.length === 0) {
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ok: true, status: "nothing-to-do", rows: [], skipped: skipped }, null, 2) + "\n");
+      return;
+    }
+    process.stdout.write("块 id 没有需要改的：派生层里的 id 格已经是链接形态。\n");
+    if (skipped.length > 0) {
+      process.stdout.write("\n有 " + skipped.length + " 行没动：\n");
+      for (const s of skipped) process.stdout.write("  " + s.path + ":" + s.line + "  " + s.id + "  " + s.reason + "\n");
+    }
+    return;
+  }
+
+  if (!args.write) {
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ok: true, dryRun: true, rows: rows, skipped: skipped }, null, 2) + "\n");
+      return;
+    }
+    process.stdout.write("把派生层的块 id 改成链接（未落盘）\n\n");
+    for (const r of rows) {
+      process.stdout.write("  " + r.path + ":" + r.line + "\n    " + r.from + "\n    → " + r.to + "\n");
+    }
+    if (skipped.length > 0) {
+      process.stdout.write("\n没动的 " + skipped.length + " 行（不写，先处理它们）：\n");
+      for (const s of skipped) process.stdout.write("  " + s.path + ":" + s.line + "  " + s.id + "  " + s.reason + "\n");
+    }
+    process.stdout.write("\n只动派生层索引行的块 id 格，原文与其余列一个字节不动。确认后加 --write 重跑。\n");
+    return;
+  }
+
+  const bdir = path.join(listed.root, ".daily-journal", "backup");
+  fs.mkdirSync(bdir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const p of plans) {
+    const b = path.join(bdir, path.basename(p.rel) + "." + stamp + ".bak");
+    fs.writeFileSync(b, p.expectBefore);
+    p.backup = b;
+    writeNoteInObsidian(vault, p);
+  }
+
+  if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "written", rows: rows, skipped: skipped }, null, 2) + "\n");
+  else {
+    process.stdout.write("块 id 已改成链接：" + rows.length + " 行\n\n");
+    for (const r of rows) process.stdout.write("  " + r.path + ":" + r.line + "  " + r.id + "\n");
+    for (const p of plans) process.stdout.write("  备份: " + p.backup + "\n");
+    if (skipped.length > 0) {
+      process.stdout.write("\n没动的 " + skipped.length + " 行：\n");
+      for (const s of skipped) process.stdout.write("  " + s.path + ":" + s.line + "  " + s.id + "  " + s.reason + "\n");
+    }
   }
 }
 
@@ -1692,6 +2573,177 @@ function cmdMigrateTags(vault, args) {
 // ---------------------------------------------------------------------------
 
 const ID_BEGIN_RE = /^<!-- jc:begin id=(\d{8}-\d{4}-([0-9a-f]{4})) -->$/;
+
+// 正文末尾适不适合钉锚点。
+//
+// 锚点是 **` ^<块 id>` 贴在正文最后一行的末尾**，不是单起一行 —— 单起一行 Obsidian 也认（整行就是 `^id`），
+// 但那样锚点就不在正文里了，`--fix-written` 换 id 时会留下一个指向不存在块的死锚点。
+// 代价是「最后一行」必须真能接受尾巴，下面几类不能钉，宁可不钉也不弄坏原文：
+//   末行是表格行 -> 多出一个单元格，表格直接坏掉
+//   末行是代码围栏 / 正文末尾在未闭合的代码块里 -> 围栏作废，后面的原文全变代码
+//   末尾有空行 -> 锚点落到新起的一行上，Obsidian 不认（`^id` 得在段落开头或整行）
+function tailAnchorBlocker(body) {
+  if (String(body).trim() === "") return "块内没有正文";
+  if (/\n[ \t]*$/.test(body)) return "正文末尾有空行：锚点会落到新起的一行上，Obsidian 认不出来";
+  const lines = String(body).split("\n");
+  let fences = 0;
+  for (const ln of lines) if (/^\s*(```|~~~)/.test(ln)) fences += 1;
+  if (fences % 2 === 1) return "正文末尾在未闭合的代码块里";
+  let last = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() !== "") {
+      last = lines[i];
+      break;
+    }
+  }
+  if (/^\s*(```|~~~)/.test(last)) return "正文最后一行是代码块围栏";
+  if (/^\s*\|/.test(last)) return "正文最后一行是表格行";
+  if (/^#{1,6}\s/.test(last)) return "正文最后一行是标题";
+  if (/^\s*<!--/.test(last)) return "正文最后一行是注释";
+  if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(last)) return "正文最后一行是分隔线";
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// 迁移：给旧块补上尾部锚点
+//
+// 锚点（C10）让 `[[笔记#^id]]` 能跳回那段思考，但 2026-09-20 之前写入的块没有。
+// 补锚点是**纯追加**：正文一个字节不动（锚点不算正文，sha1 定义未变），所以它不碰 R3。
+// 仍然逐块开闸：正文 hash 与块 id 对不上的先不补（先跑 --verify-ids --write），
+// 末尾不适合钉的也不补，把原因报出来。
+// ---------------------------------------------------------------------------
+
+function cmdAddAnchors(vault, args) {
+  const dp = dailyPath(vault);
+  const slash = dp.lastIndexOf("/");
+  const folder = slash > 0 ? dp.slice(0, slash) : "";
+  if (folder === "") fail("定位不到日记目录（daily:path = " + dp + "）");
+  const listed = evalInObsidian(
+    vault,
+    "globalThis.__DJ_P = " + JSON.stringify({ folder: folder }) + ";\n" + MIGRATE_LIST_PAYLOAD,
+  );
+
+  const want = typeof args.path === "string" ? args.path : null;
+  const files = want
+    ? listed.files.filter((f) => f.path === want || f.path.endsWith("/" + want) || path.basename(f.path) === want)
+    : listed.files;
+  if (files.length === 0) fail("在日记目录里找不到 " + want + "（本模式只扫 " + folder + "）");
+
+  const rows = [];
+  const plans = [];
+  for (const f of files) {
+    const lines = f.content.split("\n");
+    const adds = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(ID_BEGIN_RE);
+      if (!m) continue;
+      const id = m[1];
+      const endLine = "<!-- jc:end id=" + id + " -->";
+      let j = -1;
+      for (let k = i + 1; k < lines.length; k++) {
+        if (lines[k] === endLine) {
+          j = k;
+          break;
+        }
+      }
+      const at = { path: f.path, line: i + 1, id: id };
+      if (j < 0) {
+        rows.push(Object.assign({}, at, { action: "skip", reason: "end 标记缺失" }));
+        continue;
+      }
+      const body = lines.slice(i + 2, j - 1).join("\n");
+      if (/ \^[A-Za-z0-9._-]+$/.test(body)) {
+        // 已经有锚点的块一个字节不动；值对不对是 --verify-ids 的事。
+        rows.push(Object.assign({}, at, { action: "keep", reason: "已有锚点" }));
+        continue;
+      }
+      const got = crypto.createHash("sha1").update(stripTailAnchor(body), "utf8").digest("hex").slice(0, 4);
+      if (got !== m[2]) {
+        rows.push(
+          Object.assign({}, at, {
+            action: "skip",
+            reason: "正文 hash 与块 id 不一致（先跑 --verify-ids --write）",
+          }),
+        );
+        continue;
+      }
+      const why = tailAnchorBlocker(body);
+      if (why) {
+        rows.push(Object.assign({}, at, { action: "skip", reason: why }));
+        continue;
+      }
+      // 锚点钉在**最后一行非空行**的末尾。上面已挡掉末尾有空行的情况，这一步只是防御。
+      let k = j - 2;
+      while (k > i + 1 && lines[k].trim() === "") k--;
+      adds.push({ id: id, at: k, before: lines[k], after: lines[k] + " ^" + id });
+    }
+    if (adds.length === 0) continue;
+
+    const afterLines = lines.slice();
+    for (const a of adds) afterLines[a.at] = a.after;
+    const after = afterLines.join("\n");
+    // 除了这几个追加串，文件其他部分必须逐字节未动：全部推回去后应正好等于原文。
+    let restored = after;
+    for (const a of adds) restored = replaceAllText(restored, a.after, a.before);
+    const untouched = restored === f.content;
+    plans.push({ rel: f.path, expectBefore: f.content, after: after, adds: adds, untouched: untouched });
+    for (const a of adds) {
+      rows.push({ path: f.path, line: a.at + 1, id: a.id, action: "add", before: a.before, after: a.after });
+    }
+  }
+
+  const added = rows.filter((r) => r.action === "add");
+  const kept = rows.filter((r) => r.action === "keep");
+  const skipped = rows.filter((r) => r.action === "skip");
+
+  if (added.length === 0) {
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ok: true, status: "nothing-to-do", blocks: rows.length, added: 0, kept: kept.length, skipped: skipped, rows: rows }, null, 2) + "\n");
+    } else {
+      process.stdout.write("补锚点：没有需要补的块（共 " + rows.length + " 个块，已有锚点 " + kept.length + " 个）\n");
+      for (const r of skipped) process.stdout.write("  跳过 " + r.path + ":" + r.line + "  " + r.id + "  " + r.reason + "\n");
+    }
+    return;
+  }
+
+  if (!args.write) {
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ok: true, dryRun: true, plans: plans, rows: rows }, null, 2) + "\n");
+    } else {
+      process.stdout.write("补尾部锚点（未落盘）\n\n");
+      for (const p of plans) {
+        process.stdout.write("  " + p.rel + "  补 " + p.adds.length + " 个\n");
+        for (const a of p.adds) process.stdout.write("    行 " + (a.at + 1) + "  " + a.id + "\n      「" + a.before + "」\n      → 「" + a.after + "」\n");
+      }
+      for (const r of skipped) process.stdout.write("  跳过 " + r.path + ":" + r.line + "  " + r.id + "  " + r.reason + "\n");
+      process.stdout.write("\n只追加锚点，正文与标记一个字节不动。确认后加 --write 重跑。\n");
+    }
+    return;
+  }
+
+  const broken = plans.filter((p) => !p.untouched);
+  if (broken.length > 0) fail("除了追加串还动到了别的字节：" + broken.map((p) => p.rel).join("、") + "\n  脚本 bug，已中止未落盘。");
+
+  const bdir = path.join(listed.root, ".daily-journal", "backup");
+  fs.mkdirSync(bdir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const written = [];
+  for (const p of plans) {
+    const b = path.join(bdir, path.basename(p.rel) + "." + stamp + ".bak");
+    fs.writeFileSync(b, p.expectBefore);
+    p.backup = b;
+    writeNoteInObsidian(vault, p);
+    written.push({ path: p.rel, added: p.adds.length, backup: b });
+  }
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify({ ok: true, status: "written", written: written, added: added, kept: kept.length, skipped: skipped, rows: rows }, null, 2) + "\n");
+  } else {
+    process.stdout.write("补锚点完成\n\n");
+    for (const w of written) process.stdout.write("  " + w.path + "  补了 " + w.added + " 个块\n    备份: " + w.backup + "\n");
+    for (const r of skipped) process.stdout.write("  跳过 " + r.path + ":" + r.line + "  " + r.id + "  " + r.reason + "\n");
+  }
+}
 
 function cmdVerifyIds(vault, args) {
   const dp = dailyPath(vault);
@@ -1724,26 +2776,47 @@ function cmdVerifyIds(vault, args) {
         continue;
       }
       const body = lines.slice(i + 2, j - 1).join("\n");
-      const got = crypto.createHash("sha1").update(body, "utf8").digest("hex").slice(0, 4);
-      rows.push({ path: f.path, line: i + 1, id: m[1], stored: m[2], computed: got, ok: got === m[2] });
-      if (got !== m[2]) {
-        stale.push({ id: m[1], newId: m[1].slice(0, m[1].length - 5) + "-" + got, from: i, to: j });
+      // 锚点不算正文：先剥掉再算 hash，不然每个带锚点的新块都会被判成「正文被改过」。
+      const anchor = (body.match(/ \^([A-Za-z0-9._-]+)$/) || [])[1] || null;
+      const got = crypto.createHash("sha1").update(stripTailAnchor(body), "utf8").digest("hex").slice(0, 4);
+      const hashOk = got === m[2];
+      // 锚点是块 id 的副本，两者不一致一样算对不上 —— 只差锚点也报出来，别让它悄悄烂掉。
+      const anchorOk = anchor === null || anchor === m[1];
+      rows.push({
+        path: f.path, line: i + 1, id: m[1], stored: m[2], computed: got, anchor: anchor,
+        ok: hashOk && anchorOk,
+        reason: !hashOk ? "正文 hash 与块 id 不一致" : anchorOk ? undefined : "尾部锚点与块 id 不一致",
+      });
+      if (!hashOk || !anchorOk) {
+        stale.push({
+          id: m[1],
+          newId: m[1].slice(0, m[1].length - 5) + "-" + got,
+          from: i,
+          to: j,
+          anchorAt: anchor === null ? -1 : j - 2,
+          // 锚点的**原值**得记下来：回推证明要拿它把锚点还原，
+          // 只记 anchorAt 的话「锚点值不对、hash 对」这种情况回推不回去，会被误判成块外被牵连。
+          anchorWas: anchor,
+        });
       }
     }
     if (stale.length === 0) continue;
     for (const s of stale) {
       lines[s.from] = "<!-- jc:begin id=" + s.newId + " -->";
       lines[s.to] = "<!-- jc:end id=" + s.newId + " -->";
+      // 锚点跟着 id 一起换：只改标记会留下一个指向不存在块的锚点。
+      if (s.anchorAt >= 0) lines[s.anchorAt] = lines[s.anchorAt].replace(/ \^[A-Za-z0-9._-]+$/, " ^" + s.newId);
     }
     let after = lines.join("\n");
-    for (const s of stale) after = replaceAllText(after, BT_CHAR + s.id + BT_CHAR, BT_CHAR + s.newId + BT_CHAR);
-    // 块外必须逐字节未动：把上面三处 id 字符串全推回去，应正好等于原文
+    after = remapIndexRowIds(after, stale.map((s) => ({ from: s.id, to: s.newId })));
+    // 块外必须逐字节未动：把上面几处 id 字符串全推回去，应正好等于原文
     let restored = after;
     for (const s of stale) {
       restored = replaceAllText(restored, "<!-- jc:begin id=" + s.newId + " -->", "<!-- jc:begin id=" + s.id + " -->");
       restored = replaceAllText(restored, "<!-- jc:end id=" + s.newId + " -->", "<!-- jc:end id=" + s.id + " -->");
-      restored = replaceAllText(restored, BT_CHAR + s.newId + BT_CHAR, BT_CHAR + s.id + BT_CHAR);
+      if (s.anchorAt >= 0) restored = replaceAllText(restored, " ^" + s.newId, " ^" + s.anchorWas);
     }
+    restored = remapIndexRowIds(restored, stale.map((s) => ({ from: s.newId, to: s.id })));
     plans.push({ rel: f.path, expectBefore: f.content, after: after, stale: stale, untouched: restored === f.content });
   }
 
@@ -1765,7 +2838,7 @@ function cmdVerifyIds(vault, args) {
           "  " + r.path + ":" + r.line + "  " + r.id + "\n    id 里的 hash " + (r.stored || "—") + "，正文实算 " + (r.computed || "—") + (r.reason ? "  " + r.reason : "") + "\n",
         );
       }
-      process.stdout.write("\n含义：这些块的正文在写入后被改过，或由旧版脚本写入。\n加 --write 把 id 重算成与正文一致（只改 id 字符串，正文一个字节不动）。\n");
+      process.stdout.write("\n含义：这些块的正文在写入后被改过，或由旧版脚本写入。\n加 --write 把 id 重算成与正文一致（只改 id 与尾部锚点这两串字符，正文一个字节不动）。\n");
     }
     process.exit(1);
   }
@@ -1780,13 +2853,8 @@ function cmdVerifyIds(vault, args) {
   for (const p of plans) {
     const b = path.join(bdir, path.basename(p.rel) + "." + stamp + ".bak");
     fs.writeFileSync(b, p.expectBefore);
-    const res = evalInObsidian(
-      vault,
-      "globalThis.__DJ_P = " + JSON.stringify({ path: p.rel, expectBefore: p.expectBefore, after: p.after }) + ";\n" + FIXWRITTEN_PAYLOAD,
-    );
-    if (!res.ok) fail("落盘失败 " + p.rel + "：" + res.error);
-    if (!res.beforeMatched) fail("落盘前比对失败 " + p.rel + "：文件在读取后被改过，未写入");
-    if (!res.readBackExact) fail("回读不一致 " + p.rel + "：备份在 " + b);
+    p.backup = b;
+    writeNoteInObsidian(vault, p);
     for (const s of p.stale) healed.push({ path: p.rel, id: s.id, newId: s.newId });
   }
 
@@ -1794,13 +2862,17 @@ function cmdVerifyIds(vault, args) {
   else {
     process.stdout.write("id 已重算：" + staleCount + " 个块\n\n");
     for (const h of healed) process.stdout.write("  " + h.path + "  " + h.id + " -> " + h.newId + "\n");
-    process.stdout.write("\n正文一个字节未动，只换了 id 字符串。\n");
+    process.stdout.write("\n正文一个字节未动，只换了 id 与尾部锚点这两串字符。\n");
   }
 }
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
   CLI_ARGS = args;
+  // --kind 缺省是 thought：不传时行为与改动前逐字节相同。
+  if (args.kind !== undefined && args.kind !== "thought" && args.kind !== "todo") {
+    fail("--kind 只能是 thought 或 todo，收到 " + JSON.stringify(args.kind) + "\n  （缺省 = thought，向后兼容）");
+  }
   // --help 不需要 Obsidian；其余路径先做 preflight。
   if (!(args.help || args.h)) preflight();
   const vault = typeof args.vault === "string" ? args.vault : DEFAULT_VAULT;
@@ -1826,11 +2898,13 @@ function main() {
         "",
         "  写入（默认 dry-run）:",
         "    --content=<文本> | --content-file=<路径> | --stdin",
-        "    --category=<#标签...>     必填，分类列写裸标签，多个用空格分隔",
+        "    --kind=thought|todo       可选，默认 thought；todo 写 ## 今日待办（任务行），不动 jc 层",
+        "    --category=<#标签...>     必填（--kind=todo 时不用），分类列写裸标签，多个用空格分隔",
         "    --allow-new-tag           放行词表外的新标签（D5 闸门：先问用户，点头后才加）",
-        "    --links=<[[a]]、[[b]]>    可选；纯 wikilink 列表（、分隔、禁换行），目标须真实存在；单元格 | 要写 \\|；违规退出 7",
+        "    --links=<[[a]]、[[b]]>    可选，只用于思考捕获；纯 wikilink 列表（、分隔、禁换行），目标须真实存在；单元格 | 要写 \\|；违规退出 7",
         "    --time=HH:MM              可选，默认当前（也接受 HHmm）",
-        "    --date=YYYY-MM-DD         可选，默认今天（用于块 id）",
+        "    --date=YYYY-MM-DD         可选，默认今天（用于块 id；也是 ➕ 的兜底来源）",
+        "    --no-task-add-created     --kind=todo 时不自动补 ➕（默认会补，取**笔记日期**，见 D22）",
         "    --write                   落盘；缺省只出 diff",
         "  校对（不改写，只给建议）:",
         "    --proofread               检查输入准确性，列出疑似问题与建议",
@@ -1839,12 +2913,19 @@ function main() {
         "    --id=<块 id>              可逗号分隔多个，形如 20260916-1549-0882",
         "    --replace='错→对'          可逗号分隔多对；命中数会被验证，且必须能反向回代",
         "    --write                   落盘（会先备份到 .daily-journal/backup/）",
+        "  修 jc 块之外的机械错字（模板片段被改坏等；默认 dry-run）:",
+        "    --repair-text             需要 --path 与 --replace；每对必须全文件只命中一次",
+        "    --path=<路径|文件名>       只修这一个文件；块内正文请改用 --fix-written",
+        "    --write                   落盘（会先备份到 .daily-journal/backup/）",
+        "  把历史笔记里裹反引号的「块 id」格改写成块链接（默认 dry-run）:",
+        "    --link-block-ids          只动派生层索引行的 id 格；块缺尾部锚点的先跑 --add-anchors",
         "  迁移派生层的历史分类（默认 dry-run）:",
         "    --migrate-tags            把索引里裹反引号的分类还原成裸标签",
         "    --map='旧→新'             可逗号分隔多对，用于个别改写（如 life/HomeLab→life）",
         "    --allow-new-tag           迁移结果含词表外新标签时放行（同上，先问用户）",
         "  自检:",
-        "    --verify-ids              校 jc 块的 id 是否仍与正文自洽；不一致退 1",
+        "    --verify-ids              校 jc 块的 id 与尾部锚点是否仍与正文自洽；不一致退 1",
+        "    --add-anchors             给旧块补上尾部锚点（纯追加，让 [[笔记#^id]] 跳得回来）",
         "    --write                   把对不上的 id 重算回一致（正文不动）",
         "    --fix=safe                写入时自动套用无损修正（行尾空白/重复虚词/大小写）",
         "    --fix=all                 写入时套用全部可机械修正项（含改字，需用户确认）",
@@ -1879,6 +2960,16 @@ function main() {
     return;
   }
 
+  if (args["repair-text"]) {
+    cmdRepairText(vault, args);
+    return;
+  }
+
+  if (args["link-block-ids"]) {
+    cmdLinkBlockIds(vault, args);
+    return;
+  }
+
   if (args["migrate-tags"]) {
     cmdMigrateTags(vault, args);
     return;
@@ -1886,6 +2977,11 @@ function main() {
 
   if (args["verify-ids"]) {
     cmdVerifyIds(vault, args);
+    return;
+  }
+
+  if (args["add-anchors"]) {
+    cmdAddAnchors(vault, args);
     return;
   }
 
@@ -2014,32 +3110,41 @@ function main() {
   if (content.trim() === "") {
     fail("内容为空或只有空白，没有可写入的原文。\n  （校对里 empty 是 blocking 项，写入侧同一口径：不落盘）");
   }
-  if (typeof args.category !== "string" || args.category.length === 0) {
+  const isTodo = args.kind === "todo";
+  if (isTodo && typeof args.links === "string" && args.links.trim()) {
+    fail("--links 只给思考捕获用（它写索引表的关联列）；待办不产生索引行，分类写在行内标签里（D21）。");
+  }
+
+  if (!isTodo && (typeof args.category !== "string" || args.category.length === 0)) {
     fail("缺少 --category=<#标签...>（分类列写裸标签，可多个）");
   }
-  const tagVocab = loadTags(vault, args);
-  const knownTags = {
-    skeleton: new Set(tagVocab.tags.filter((t) => t.source === "skeleton").map((t) => t.tag)),
-    live: new Set(tagVocab.tags.filter((t) => t.source === "vault").map((t) => t.tag)),
-  };
-  const catCheck = validateTags(args.category, knownTags);
-  if (!catCheck.ok) {
-    fail(
-      "--category 不合法：" +
-        catCheck.reason +
-        "\n  （D5：不静默降级。先跑 --tags 看词表、--classify 看候选）",
-    );
-  }
-  if (catCheck.novel.length > 0 && !args["allow-new-tag"]) {
-    fail(
-      "--category 里有词表外的新标签：" + catCheck.novel.join("、") +
-        "\n  新标签是允许的，但**必须先问用户**。用户点头后加 --allow-new-tag 重跑。" +
-        "\n  （D5：不静默降级，也不静默扩张词表）",
-    );
+  if (!isTodo) {
+    // 分类列的词表闸门只对思考捕获跑：待办不产生索引行，分类写在行内标签（D21），
+    // 硬把 --category 的空串丢进 validateTags 会以「分类为空」直接失败。
+    const tagVocab = loadTags(vault, args);
+    const knownTags = {
+      skeleton: new Set(tagVocab.tags.filter((t) => t.source === "skeleton").map((t) => t.tag)),
+      live: new Set(tagVocab.tags.filter((t) => t.source === "vault").map((t) => t.tag)),
+    };
+    const catCheck = validateTags(args.category, knownTags);
+    if (!catCheck.ok) {
+      fail(
+        "--category 不合法：" +
+          catCheck.reason +
+          "\n  （D5：不静默降级。先跑 --tags 看词表、--classify 看候选）",
+      );
+    }
+    if (catCheck.novel.length > 0 && !args["allow-new-tag"]) {
+      fail(
+        "--category 里有词表外的新标签：" + catCheck.novel.join("、") +
+          "\n  新标签是允许的，但**必须先问用户**。用户点头后加 --allow-new-tag 重跑。" +
+          "\n  （D5：不静默降级，也不静默扩张词表）",
+      );
+    }
   }
 
   // 关联列只能链真实存在的文件；没有实际文档，关联就没有意义（A3）。
-  if (typeof args.links === "string" && args.links.trim()) {
+  if (!isTodo && typeof args.links === "string" && args.links.trim()) {
     const lc = checkLinks(vault, args.links);
     if (lc.malformed) {
       fail(
@@ -2062,6 +3167,54 @@ function main() {
   }
 
   let finalContent = content;
+
+  // 待办层只接任务行：**固定前**、在 --fix-pair / --fix 之后做最后一道阻断检查，
+  // 只要还剩下阻断级发现（相对时间、错状态符、非任务行）就不落盘。
+  // 这是 D24（相对时间不落盘）与「- [?] 不落盘」唯一的机械守住点 ——
+  // 不先校验就写，错的状态符 / 相对时间会以完全合法的行形式落进去，五项校验全绿。
+  const todoGate = function (text) {
+    if (!isTodo) return;
+
+    // D21/B4：行内**主题**标签仍要过同一道 D5 闸门（`#gtd/*` 除外，那是任务状态）。
+    // 闸门开在 --fix-pair / --fix 之后，判的是真正要落盘的那份文本。
+    const topicTags = todoTopicTags(text);
+    if (topicTags.length > 0) {
+      const know = knownTagSets(loadTags(vault, args));
+      const check = validateTags(topicTags.join(" "), know);
+      if (!check.ok) {
+        fail(
+          "待办行里的标签不合法：" + check.reason +
+            "\n  （D5：不静默降级。主题标签走分类词表那套；任务状态写 #gtd/*）",
+        );
+      }
+      if (check.novel.length > 0 && !args["allow-new-tag"]) {
+        fail(
+          "待办行里有词表外的新标签：" + check.novel.join("、") +
+            "\n  新标签是允许的，但**必须先问用户**。用户点头后加 --allow-new-tag 重跑。" +
+            "\n  （D5：不静默降级，也不静默扩张词表）",
+        );
+      }
+    }
+
+    const pf = runProofread(vault, text, skipSet(args));
+    for (const f of pf.findings) {
+      if (f.blocking) continue;
+      process.stderr.write(
+        "daily-journal: 待办提醒  " + f.kind + "  " + f.found + "\n   -> " + f.suggestion + "\n"
+      );
+    }
+    const blockers = pf.findings.filter((f) => f.blocking);
+    if (blockers.length > 0) {
+      fail(
+        "待办捕获没通过校对，未落盘：\n" +
+          blockers
+            .map((f) => "  " + f.kind + "  行 " + (f.line || "?") + "  " + f.found + "\n    -> " + f.suggestion)
+            .join("\n") +
+          "\n  （先跑 --proofread 看详情；确认后用 --fix-pair / --fix 修好再重跑）",
+        1,
+      );
+    }
+  };
 
   // 模型提的「错→对」对（W1）。脚本查不出的中文别字走这条通道：
   // 模型只出对与理由，替换由脚本做；每一对都必须命中，命中不到即拒绝 ——
@@ -2141,6 +3294,9 @@ function main() {
     finalContent = r.text;
   }
 
+  // 待办通道的最后一道闸：跑在 --fix-pair / --fix 之后，看的是真正要落盘的那份文本。
+  todoGate(finalContent);
+
   const parts = localParts();
   const t =
     typeof args.time === "string" ? parseTime(args.time) : { compact: parts.hm, display: parts.hms };
@@ -2152,25 +3308,85 @@ function main() {
   // dry-run 不落盘，也就不该创建当日笔记：只取路径，缺文件由 payload 报 note-not-found。
   const rel =
     typeof args.path === "string" ? args.path : args.write ? ensureDaily(vault) : dailyPath(vault);
+
+  // ➕ 用**笔记日期**，不是脚本运行日（D22）。补记昨天的日记时运行日是错的那一天，
+  // 而补错值的行仍然是合法任务行，五项校验全绿 —— 这里取错，后面没有任何东西拦得住。
+  const noteDateFromPath = noteDateFromName(rel);
+  const noteDate =
+    noteDateFromPath ||
+    (typeof args.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.date) ? args.date : parts.date);
+  const createdDateSource = noteDateFromPath
+    ? "note-name"
+    : typeof args.date === "string"
+    ? "--date"
+    : "run-date";
+
+  // 待办行只允许补 ➕ 这一个字段（D22）：它是机制字段、由笔记日期完全确定、可机械回代，
+  // 不算改写用户原文；其余一个字符都不动（R3）。
+  let todoContent = finalContent;
+  let createdAdded = 0;
+  if (isTodo && !args["no-task-add-created"]) {
+    const todoLines = todoContent.split("\n");
+    for (let i = 0; i < todoLines.length; i++) {
+      const m = todoLines[i].match(/^([ \t]*[-*+][ \t]+\[.\][ \t]*)(.*)$/);
+      if (!m) continue;
+      if (m[2].indexOf("➕") >= 0) continue;
+      const at = m[2].search(/(🛫|⏳|📅|🔁|✅|❌)/);
+      const head = (at >= 0 ? m[2].slice(0, at) : m[2]).replace(/[ \t]+$/, "");
+      todoLines[i] = m[1] + head + " ➕ " + noteDate + (at >= 0 ? " " + m[2].slice(at) : "");
+      createdAdded++;
+    }
+    todoContent = todoLines.join("\n");
+  }
+
+  // 尾部锚点（C10）：钉在正文最后一行的末尾，让 [[笔记#^id]] 跳得回这段思考。
+  // 它是 agent 自己生成的 token、不属于正文，但**位置在正文里**，所以末尾不适合钉时就不钉 ——
+  // 只报出来，捕获本身照走（原文优先，绝不为了埋个锚点去弄坏 markdown）。
+  let anchor = "";
+  let anchorSkipped = null;
+  if (!isTodo) {
+    anchorSkipped = tailAnchorBlocker(finalContent);
+    if (anchorSkipped === null) anchor = " ^" + id;
+  }
+
   const payload = {
     path: rel,
-    content: finalContent,
+    content: isTodo ? todoContent : finalContent,
+    anchor: anchor,
+    kind: isTodo ? "todo" : "thought",
+    noteDate: noteDate,
+    createdDateSource: createdDateSource,
     id,
     time: t.display,
-    category: args.category,
+    category: isTodo ? "" : args.category,
     links: typeof args.links === "string" ? args.links : "",
     write: !!args.write,
     sections: SECTIONS,
   };
+
+  // 捕获通道也要能在落盘前证明「Obsidian 收到的 = Node 算出的」（C11）：
+  // 指纹域与 WRITE_PAYLOAD 里的 stampSrc 逐字对应。
+  const captureStamp = contentStamp(captureStampSrc(payload));
+  payload.stampLen = captureStamp.len;
+  payload.stampSum = captureStamp.sum;
 
   const code = "globalThis.__DJ_P = " + JSON.stringify(payload) + ";\n" + WRITE_PAYLOAD;
   const res = evalInObsidian(vault, code);
 
   if (fixReport) res.fixReport = fixReport;
   if (pairReport) res.pairReport = pairReport;
+  if (anchorSkipped) res.anchorSkipped = anchorSkipped;
 
-  if (!res.ok && res.status !== "duplicate") {
+  if (!res.ok && res.status !== "duplicate" && res.error !== "task-line-duplicate") {
     process.stderr.write(JSON.stringify(res, null, 2) + "\n");
+    if (res.error === "transport-corrupt") {
+      process.stderr.write(
+        "daily-journal: 载荷在传进 Obsidian 的路上被改过（长度 " + res.gotLen + "，应为 " + res.wantLen +
+          "），已中止、一个字未写。\n" +
+          "  这是 obsidian CLI 的 code= 入参的已知失真；本脚本已把非 ASCII 转义送出，\n" +
+          "  仍出现请升级 CLI，并把这条记入 decision-log。\n"
+      );
+    }
     if (res.error === "concurrent-edit") {
       process.stderr.write("daily-journal: 读取到写入之间 Obsidian 里改过这条笔记，已放弃落盘；请重跑。\n");
     }
@@ -2191,9 +3407,26 @@ function main() {
 
   if (res.status === "duplicate") {
     process.stdout.write(
-      (args.json ? JSON.stringify(res, null, 2) : "重复：相同内容已在 " + res.path + " 中（id=" + res.id + "），未写入。") + "\n"
+      (args.json
+        ? JSON.stringify(res, null, 2)
+        : (res.kind === "todo" ? "重复：这几行已在 " : "重复：相同内容已在 ") +
+          res.path +
+          " 中（" +
+          (res.kind === "todo" ? "行级判重，无 id" : "id=" + res.id) +
+          "），未写入。") + "\n"
     );
     return;
+  }
+
+  if (res.error === "task-line-duplicate") {
+    process.stderr.write(
+      "daily-journal: 待办行部分重复，不静默跳过重复行。\n  重复：" +
+        res.duplicateLines.join("、") +
+        "\n  新行：" +
+        res.newLines.join("、") +
+        "\n  请把要落的那几条单独重跑。\n"
+    );
+    process.exit(6);
   }
 
   const diff = res.before !== undefined && res.after !== undefined ? unifiedDiff(res.before, res.after) : "";
@@ -2204,7 +3437,18 @@ function main() {
   if (args.json) process.stdout.write(JSON.stringify(res, null, 2) + "\n");
   else {
     process.stdout.write("目标: " + res.path + "\n");
-    process.stdout.write("状态: " + res.status + "  id: " + res.id + "  分类: " + res.category + "\n");
+    if (res.kind === "todo") {
+      process.stdout.write(
+        "状态: " + res.status + "  待办行: " + res.addedLines.length +
+          (createdAdded > 0 ? "  补 ➕ ×" + createdAdded : "") +
+          "  （➕=" + noteDate + "，来源 " + createdDateSource + "）\n"
+      );
+    } else {
+      process.stdout.write("状态: " + res.status + "  id: " + res.id + "  分类: " + res.category + "\n");
+      if (res.anchorSkipped) {
+        process.stdout.write("注意: 没钉尾部锚点 —— " + res.anchorSkipped + "\n  后果：这一段不能被 [[本笔记#^id]] 链到（正文照写了）。\n");
+      }
+    }
     if (res.fixReport && res.fixReport.changed) {
       process.stdout.write("修正: 已套用 " + res.fixReport.replacements + " 处 -> " + res.fixReport.applied.join("、") + "\n");
     }
