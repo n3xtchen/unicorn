@@ -1,6 +1,6 @@
 ---
 name: git-commit-style
-description: 根据当前仓库的 Commit 历史生成、改写或评审符合用户习惯的 Commit 信息（默认中文）。用户要求编写提交信息、整理提交标题、规范 Commit 风格或检查 Commit 文案时使用。
+description: 根据当前仓库的 Commit 历史生成、改写或评审符合用户习惯的 Commit 信息（默认中文），并在提交前对齐代码与其对口文档。用户要求编写提交信息、整理提交标题、规范 Commit 风格、检查 Commit 文案，或判断某次代码改动是否漏了文档时使用。
 ---
 
 # Commit 编写风格
@@ -10,6 +10,8 @@ Read [the decision log](references/decision-log.md) when changing this skill or 
 ## 目标
 
 帮助用户生成简洁、具体、结果导向的中文 Commit 信息。默认参考当前仓库的提交历史，不把纯英文 Commit 作为中文风格依据；包含中文描述的混合语言 Commit 可以作为补充依据。
+
+同时守住一个前置口径：本次改动对应的文档必须与代码一起进同一个 Commit，不留到事后补 `docs(...)`。
 
 ## 工作流程
 
@@ -41,8 +43,10 @@ Read [the decision log](references/decision-log.md) when changing this skill or 
    标题只概括提交的共同目标，不强行塞入所有具体改动。一个提交包含多个紧密相关动作时，优先使用“简洁标题 + 提交正文”表达：正文用项目符号逐条列出重要变更、合同或行为变化，通常列出 3～5 个具体点。只有用户明确要求单行标题，或变更非常简单时，才将细节压缩到标题中。
 
 10. 一个提交包含多个紧密相关动作时，可以使用提交正文并列出各项具体变更；如果动作彼此独立，应建议拆分 Commit。
-11. 需要执行 `git commit` 或 `git commit --amend` 时，提交标题与正文必须使用真实换行。优先使用带单引号分隔符的 quoted heredoc（例如 `git commit -F- <<'EOF'`），不要在普通字符串中使用 `\\n` 拼接正文；否则 `\\n` 可能被原样写入 Commit message，导致 `git log` 显示字面量 `\\n`。
-12. 提交或 amend 后，必须用 `git log -1 --format='%B'` 检查正文排版，并搜索是否存在字面量 `\\n`；必要时用 `git cat-file -p HEAD` 或十六进制检查确认实际换行。除非用户明确要求，不自动执行 `git commit`，只生成或修改提交信息。
+11. **提交前先对齐代码与文档。** 本次变更动了代码行为（接口、退出码、失败信息、默认值、校验口径等）时，提交前核对该模块文档是否仍与代码一致：skill 的 `SKILL.md` 条款与失败表、`references/decision-log.md` 的决策与验收项、`--help` 文本、README/CHANGELOG 等。确认属于本次变更的文档要对齐后与代码放进**同一个 Commit**，标题概括共同目标、正文说明同步了哪些文档；只有变更本身是纯文档工作，才单独提 `docs(...)`。
+12. **归属判不清就先问，不要强行对齐。** 判断某份文档是否由本次变更负责，需要三条都成立：同一目录或模块；文档里明确提到被改的符号、条款或行为；git 历史中曾与该代码一起提交。三条不齐就当作不确定：不改那份文档，把缺口单列出来向用户确认，宁可留着缺口也不动职责范围不清的文档。
+13. 需要执行 `git commit` 或 `git commit --amend` 时，提交标题与正文必须使用真实换行。优先使用带单引号分隔符的 quoted heredoc（例如 `git commit -F- <<'EOF'`），不要在普通字符串中使用 `\\n` 拼接正文；否则 `\\n` 可能被原样写入 Commit message，导致 `git log` 显示字面量 `\\n`。
+14. 提交或 amend 后，必须用 `git log -1 --format='%B'` 检查正文排版，并搜索是否存在字面量 `\\n`；必要时用 `git cat-file -p HEAD` 或十六进制检查确认实际换行。除非用户明确要求，不自动执行 `git commit`，只生成或修改提交信息。
 
 ## 输出要求
 
@@ -51,6 +55,7 @@ Read [the decision log](references/decision-log.md) when changing this skill or 
 - 如果用户要求评审已有 Commit，指出类型、Scope、动作对象和是否符合仓库历史风格，并给出改写版本。
 - 如果仓库历史同时存在中文前缀（例如“文档：”）和 Conventional Commits，默认优先使用仓库近期、目标模块更常见的格式。
 - 不为了追求中文而翻译已经约定俗成的技术标识，也不把英文技术术语误判为英文 Commit 风格。
+- 如果本次变更动了代码却缺对口文档，先指出缺口并询问，不要默认把文档留到下一个 Commit。
 
 ## 示例
 
