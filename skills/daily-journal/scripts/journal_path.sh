@@ -4,7 +4,7 @@
 # 用法: journal_path.sh [vault]
 # 输出: 日记在库内的相对路径，例如 02-Done/2026-09-38w-16.md
 # 行为: 只定位，不创建、不读取、不修改任何文件。
-# 退出: 0 成功 / 2 Obsidian 未运行 / 3 CLI 调用失败 / 127 找不到 CLI
+# 退出: 0 成功 / 2 Obsidian 未运行 / 3 CLI 调用失败 / 5 CLI 超时无响应 / 127 找不到 CLI
 #
 # 路径与命名由 .obsidian/daily-notes.json 决定
 #   folder   = 02-Done
@@ -32,10 +32,59 @@ if ! pgrep -f "${OBSIDIAN_PROC_RE}" >/dev/null 2>&1; then
   exit 2
 fi
 
-out="$("${OBSIDIAN_BIN}" "vault=${VAULT}" daily:path 2>&1)" || {
+# obsidian CLI 偶发无响应。macOS 没有 coreutils 的 timeout，这里用后台进程 + 轮询兜底，
+# 阈值与 journal_apply.mjs 同源：DJ_TIMEOUT_MS（默认 30000）。
+DJ_TIMEOUT_MS="${DJ_TIMEOUT_MS:-30000}"
+case "${DJ_TIMEOUT_MS}" in
+  ''|*[!0-9]*) DJ_TIMEOUT_MS=30000 ;;
+esac
+if [ "${DJ_TIMEOUT_MS}" -lt 100 ] 2>/dev/null; then DJ_TIMEOUT_MS=30000; fi
+
+# 递归杀整棵进程树：obsidian CLI 可能派生子进程，只杀直接子进程会留下孤儿。
+kill_tree() {
+  local pid="${1}"
+  local child
+  for child in $(pgrep -P "${pid}" 2>/dev/null || true); do
+    kill_tree "${child}"
+  done
+  kill -9 "${pid}" 2>/dev/null || true
+}
+
+# run_cli <命令...>：stdout + stderr 合并输出；超时杀进程并返回 124，否则透传命令退出码。
+run_cli() {
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/dj-cli.XXXXXX")"
+  "$@" >"${tmp}" 2>&1 &
+  local pid=$!
+  local ticks=$(( DJ_TIMEOUT_MS / 100 ))
+  local i=0
+  while kill -0 "${pid}" 2>/dev/null; do
+    if [ "${i}" -ge "${ticks}" ]; then
+      kill_tree "${pid}"
+      wait "${pid}" 2>/dev/null || true
+      cat "${tmp}" 2>/dev/null || true
+      rm -f "${tmp}"
+      return 124
+    fi
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+  local rc=0
+  wait "${pid}" || rc=$?
+  cat "${tmp}"
+  rm -f "${tmp}"
+  return "${rc}"
+}
+
+rc=0
+out="$(run_cli "${OBSIDIAN_BIN}" "vault=${VAULT}" daily:path)" || rc=$?
+if [ "${rc}" -eq 124 ]; then
+  echo "daily-journal: obsidian CLI 超过 ${DJ_TIMEOUT_MS}ms 无响应（子进程已杀）。重跑通常即可；连续出现请重启 Obsidian。" >&2
+  exit 5
+fi
+if [ "${rc}" -ne 0 ]; then
   echo "daily-journal: daily:path 调用失败: ${out}" >&2
   exit 3
-}
+fi
 
 path="${out#=> }"
 path="$(printf '%s' "${path}" | tr -d '\r' | head -n 1)"

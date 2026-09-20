@@ -108,13 +108,23 @@ function obsidian(vault, args) {
       killSignal: "SIGKILL",
     });
   } catch (e) {
-    const timedOut =
-      e && (e.code === "ETIMEDOUT" || e.signal === "SIGKILL" || (e.killed && e.status === null));
+    // 只有 ETIMEDOUT 才是「本脚本自己超时杀的」。signal 单独出现 = 被外部（系统回收 /
+    // Obsidian 崩溃）杀掉，不能冒充「偶发无响应、重跑即可」，否则会盖住真实崩溃。
+    const timedOut = !!(e && e.code === "ETIMEDOUT");
+    const killedBy =
+      e && (e.signal === "SIGKILL" || e.signal === "SIGTERM") ? e.signal : null;
+    const where = "obsidian vault=" + vault + " " + args.join(" ").slice(0, 200);
     if (timedOut) {
       fail(
-        "obsidian CLI 超过 " + OBSIDIAN_TIMEOUT_MS + "ms 无响应（子进程已杀）：obsidian vault=" +
-          vault + " " + args.join(" ").slice(0, 200) +
+        "obsidian CLI 超过 " + OBSIDIAN_TIMEOUT_MS + "ms 无响应（子进程已超时杀掉）：" + where +
           "\n  这是 Obsidian 侧偶发无响应，重跑通常即可；重复出现请重启 Obsidian（可用 DJ_TIMEOUT_MS 调阈值）。",
+        4
+      );
+    }
+    if (killedBy) {
+      fail(
+        "obsidian CLI 子进程被 " + killedBy + " 终止（不是超时）：" + where +
+          "\n  多为 Obsidian 崩溃或被系统回收内存。先重跑一次；反复出现请重启 Obsidian 并查看崩溃报告。",
         4
       );
     }
@@ -2164,8 +2174,17 @@ function main() {
     if (res.error === "concurrent-edit") {
       process.stderr.write("daily-journal: 读取到写入之间 Obsidian 里改过这条笔记，已放弃落盘；请重跑。\n");
     }
-    if (res.error === "note-not-found" && !args.write) {
-      process.stderr.write("daily-journal: 当日笔记还不存在；dry-run 不建文件，加 --write 才会建。\n");
+    if (res.error === "note-not-found") {
+      if (typeof args.path === "string") {
+        // 显式 --path 指向的文件 payload 只会读、绝不创建，加 --write 也没用。
+        process.stderr.write(
+          "daily-journal: --path 指向的笔记不存在；本脚本不创建指定路径的笔记（先建好它，或改用默认当日路径 + --write）。\n"
+        );
+      } else if (!args.write) {
+        process.stderr.write(
+          "daily-journal: 当日笔记还不存在；dry-run 不建文件，加 --write 才会建（或先跑 scripts/journal_create.sh）。\n"
+        );
+      }
     }
     process.exit(res.error === "id-collision" ? 5 : 6);
   }
