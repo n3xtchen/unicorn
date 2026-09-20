@@ -468,8 +468,9 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 
 - **A1 · `obsidian()` 没有超时，会永久挂死。** `execFileSync` 不设 `timeout`，Obsidian CLI 偶发无响应
   （实测 `--tags` 约 1/60~1/138 概率卡住）就把整个脚本挂住。加 `timeout` + `killSignal: SIGKILL`，
-  超时杀子进程、退出 4，并提示重跑；阈值可用 `DJ_TIMEOUT_MS` 覆盖（默认 30000）。**这只是止损**：
+  超时杀子进程、退出 4；阈值可用 `DJ_TIMEOUT_MS` 覆盖（默认 30000）。**这只是止损**：
   Obsidian 为什么偶发无响应仍未查清，超时把「挂死」降级成「可重试的失败」。
+  当时把「超时」与「被外部杀掉」混在一条判断里（`e.signal === "SIGKILL"` 也算超时），后来拆开了，见下节。
 - **A2 · `--audit` 白读 registry。** 审计分支 `loadRegistry()` 读了却全程没用，白付多次 `eval`
   往返，且 registry 损坏会连带 audit 失败。删掉。
 - **A3 · 捕获路径没有并发守卫。** `--fix-written` 早已在读-写之间比对字节，capture 却是
@@ -489,7 +490,7 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 
 | # | 验收项 | 结果 |
 | --- | --- | --- |
-| 49 | `obsidian()` 超时 | 通过（假 CLI `sleep 30` + `DJ_TIMEOUT_MS=1000` → 1.09s 杀掉，退 4） |
+| 49 | `obsidian()` 超时 | 通过（假 CLI `sleep 30` + `DJ_TIMEOUT_MS=1000` → 1.09s 杀掉，退 4；与「被外部杀」的区分见下节 #57） |
 | 50 | `--audit` 不读 registry | 通过（`--registry` 指向损坏 JSON 仍 `ok:true`） |
 | 51 | 捕获并发守卫 | 通过（mock vault：正常 → `written`；期间被改 → `concurrent-edit` 不落盘） |
 | 52 | 高亮不计代码 | 通过（python 围栏 `if a == b` + 行内 code → 0 findings；真未闭合仍报） |
@@ -497,6 +498,36 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 | 54 | `--scope` 前缀 | 通过（`02-Don` 库内实有 0（原 14）；`02-Done` / `02-Done/` 均 15） |
 | 55 | `--fix` 无效 id | 通过（`--fix=bogus` 退 1；`autoFix:false` 的 id 也退 1；合法 id 照常套用） |
 | 56 | `--help` 免 Obsidian | 通过（`DJ_OBSIDIAN_BIN=nope --help` 正常打印、退 0；`--tags` 仍报找不到 CLI） |
+
+## obsidian CLI 超时口径统一（2026-09-20）
+
+A1 只做到「不挂死」，落地后暴露出「什么算超时」和「两个 shell 入口没有超时」两件事，一并统一。
+
+- **只有 `ETIMEDOUT` 才算「本脚本超时杀的」。** 改前 `e.code === "ETIMEDOUT" || e.signal === "SIGKILL"`
+  都算超时，于是一律提示「Obsidian 侧偶发无响应，重跑即可」。但 Node 按 `killSignal` 超时杀的，和被外部
+  （系统回收内存 / Obsidian 崩溃）杀的，在 `e.signal` 上长得一样 —— 把后者说成「偶发抖动」会盖住真实崩溃。
+  现在只在 `e.code === "ETIMEDOUT"` 时判超时；只有 signal 时走单独分支，明说**不是超时**并提示看崩溃报告。
+  两支都退 4。
+- **两个 shell 入口补同一套超时。** `journal_path.sh` / `journal_create.sh` 原本直接 `"${OBSIDIAN_BIN}" ...`，
+  没有任何超时，同样会挂死。加 `run_cli`：后台起进程、每 0.1s 轮询，复用同一个 `DJ_TIMEOUT_MS`；超时
+  `kill_tree` 后返回 124，调用侧翻译成**退出 5**。为什么不是 4：shell 侧 4 已被「创建后未找到文件」占用，
+  JS 侧的 4 是 `journal_apply.mjs` 自己的口径，两个入口各安其位、不互相冒充。
+- **`kill_tree` 递归杀整棵树。** 只杀直接子进程的话，被派生的子进程会变孤儿。`pgrep -P` 递归到叶子再
+  `kill -9`。
+- **JS 侧不需要这套（已核实）。** 一度担心 `execFileSync` 超时只杀 `obsidian` CLI 本身、留下孙进程。
+  核实结论是**不会**：`obsidian` 是单进程 socket 客户端 —— `nm -u /opt/homebrew/bin/obsidian` 的 22 个
+  未定义符号里 0 个 `fork` / `posix_spawn` / `exec`（对照组 `/bin/bash` 有 6 个），运行期 50Hz 采样 120 次
+  也没出现子进程；它只 `socket` / `connect` 到已运行的 Obsidian 应用。shell 侧的 `kill_tree` 因此是
+  **防御性**的（CLI 将来若改为 fork 仍安全），不是必需品。
+- **`note-not-found` 提示按 `--path` 分流。** 显式 `--path` 指向的文件 payload 只读不建，加 `--write` 也没用；
+  之前一律提示「dry-run 不建文件，加 `--write` 会建」，对 `--path` 是错的。现在分两句。
+
+| # | 验收项 | 结果 |
+| --- | --- | --- |
+| 57 | 超时 vs 被外部杀 | 通过（假 CLI `sleep` → 退 4「子进程已超时杀掉」；假 CLI `kill -TERM $$` / `kill -KILL $$` → 退 4「被 SIGTERM/SIGKILL 终止（不是超时）」） |
+| 58 | shell 入口超时 | 通过（假 CLI `sleep 30` + `DJ_TIMEOUT_MS=600`：`journal_path.sh` / `journal_create.sh` 均退 5；正常 0、CLI 失败 3） |
+| 59 | shell 杀整棵树 | 通过（假 CLI 里 `sleep 30 &`：超时后 `pgrep -f 'sleep 30'` 残留 0） |
+| 60 | `--path` 的 `note-not-found` | 通过（`--path=02-Done/<不存在>.md` → 「--path 指向的笔记不存在」；默认当日路径不触发） |
 
 ## 遗留
 
@@ -511,7 +542,4 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 - **捕获路径没有字节级备份。** `--fix-written` / `--migrate-tags` / `--verify-ids --write` 都会先写
   `<vault>/.daily-journal/backup/`，唯独立 capture 走 `app.vault.process()` 直接替换、不留 `.bak`
   （W6 只覆盖「改写已有原文」，capture 是追加）。要不要给捕获路径也补备份待定。
-- **JS 侧超时杀不到孙进程。** `execFileSync` 超时只能杀 `obsidian` CLI 本身，杀不到它派生的孙进程
-  （Node 的 `spawnSync` 不暴露 pid，做不到 `kill(-pgid)`）；两个 shell 入口已用 `kill_tree` 递归补齐。
-  要不要改成自己管进程组，取决于 obsidian CLI 是否真的 fork，待定。
 - 合并 `productivity/docker.md`、`productivity/mermaid.md` 时的源文件被移到 `<vault>/.trash/`，等用户确认后可清空。
