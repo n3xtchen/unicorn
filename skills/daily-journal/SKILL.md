@@ -44,8 +44,8 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 
 ## Hard rules
 
-1. **原文逐字不改（R3）.** Never paraphrase, reorder, reformat, dedent, or "improve" the user's text. 照抄时逐字节照抄，**包括** `==highlights==`、Tab 缩进、以及打错的字。没有时间戳前缀。
-   R3 管的是**照抄这个动作** —— 不允许你在抄写时顺手改。唯一例外是一道**独立、用户授权**的工序：用户事后显式要求改错字，或第 2 步你查出、且**用户点头**的中文别字。两者都走 `--fix-pair` / `--fix-written`，不走你手写。
+1. **原文不得擅自改写（R3）.** Never paraphrase, reorder, reformat, dedent, or "improve" the user's text. 照抄时逐字节照抄，**包括** `==highlights==`、Tab 缩进、以及打错的字。没有时间戳前缀。
+   R3 拦的是「擅自」—— 你自己动笔改就违反。两道**授权**改写也走脚本，不走你手写：`--fix-pair`（第 2 步查出、用户点头才改，是**闸门**）与 `--fix-written`（用户事后点名要改，是**例外**）。
 2. **默认 dry-run（D3）.** Show the diff first. Only run with `--write` after the user confirms.
 3. **不确定就问（D5）.** If the classification, the anchor, or the target note is uncertain, stop and ask. Never guess and never silently leave something `unsorted`.
 4. **Never touch `### 关联笔记`** (the dataviewjs block), the tasks blocks, or any other note.
@@ -226,7 +226,7 @@ Each additional capture in the same conversation is a new block appended after t
 
 ## 事后修正：改已写入的原文
 
-R3 说原文逐字不改。**唯一的例外是用户自己事后要求修正错字** —— 这不是放宽 R3，而是同一件事的另一面。三条约束一字不变：脚本机械执行、模型不产出最终文本、只动 `jc:begin`/`jc:end` 之间。
+R3 说原文不得擅自改写。**这里的例外是用户自己事后要求修正错字** —— 这不是放宽 R3，而是同一件事的另一面。三条约束一字不变：脚本机械执行、模型不产出最终文本、只动 `jc:begin`/`jc:end` 之间。
 
 ```bash
 # 先 dry-run（默认），看清改前 / 改后
@@ -245,7 +245,7 @@ scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便�
 3. **块外不动** —— 把块内替换全部推回去后必须正好等于原文；
 4. **id 重算** —— 正文变了 sha1 就变，id 必须跟着改（含索引行），否则「同内容 → 同 id」的幂等前提就断了。
 
-**模型绝不可以自己改日记文件。** 哪怕只改一个字，也必须走这条路径；否则「原文逐字不改」就变成一句空话。
+**模型绝不可以自己改日记文件。** 哪怕只改一个字，也必须走这条路径；否则「原文不得擅自改写」就变成一句空话。
 
 ## 自检：块 id 是否仍与正文自洽
 
