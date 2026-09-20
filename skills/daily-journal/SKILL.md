@@ -5,7 +5,7 @@ description: Capture text verbatim into today's Obsidian daily journal (02-Done)
 
 # Daily Journal Capture
 
-Append what the user gives you **verbatim** into today's daily note in the `nextlink` vault, then attach a classification and links in a separate, rebuildable derived layer.
+Append what the user gives you **verbatim** into today's daily note in the configured vault (default `nextlink`; override with `$DJ_VAULT` or `--vault=`), then attach a classification and links in a separate, rebuildable layer.
 
 Read [decision-log.md](references/decision-log.md) before changing this skill or when a write boundary is ambiguous.
 分类是**库内实时标签**：词表 = 文档里维护的一二级骨架 ∪ 限定目录内实有的标签，**不由封闭配置文件决定**（封闭配置会过期）。`registry.json` 由 vault 里那份分类词表机械派生，现在产两样东西：**标签骨架**（分类用）与**拼写词表**（校对用）。vault/CLI 事实见 [vault-conventions.md](references/vault-conventions.md)。

@@ -6,9 +6,9 @@
 
 | 项 | 值 |
 | --- | --- |
-| vault 名 | `nextlink` |
-| vault 根 | `/Users/nextchen/Library/Mobile Documents/iCloud~md~obsidian/Documents/nextlink` |
-| CLI | `/opt/homebrew/bin/obsidian` |
+| vault 名 | `nextlink`（默认值；可用 `$DJ_VAULT` 覆盖，`--vault=` 优先级更高） |
+| vault 根 | **不写死**。运行时向 Obsidian 取 `app.vault.adapter.basePath` —— 各人机器不同，写死就不通用了 |
+| CLI | `PATH` 里的 `obsidian`；可用 `$DJ_OBSIDIAN_BIN` 指定，**不写死** |
 | 目录 | iCloud 同步目录，文件名与内容含中文与 emoji |
 
 ## 日记命名（来源：`.obsidian/daily-notes.json`）

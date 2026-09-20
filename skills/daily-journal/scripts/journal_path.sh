@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-VAULT="${1:-nextlink}"
+VAULT="${1:-${DJ_VAULT:-nextlink}}"
 OBSIDIAN_BIN="${DJ_OBSIDIAN_BIN:-obsidian}"
 OBSIDIAN_PROC_RE="${DJ_OBSIDIAN_PROC_RE:-MacOS/Obsidian$}"
 

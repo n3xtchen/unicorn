@@ -62,7 +62,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 
 ## Obsidian vault 体例
 
-Vault 根：`/Users/nextchen/Library/Mobile Documents/iCloud~md~obsidian/Documents/nextlink/`
+Vault 根：`<vault>` —— **不要写死绝对路径**。向 Obsidian 索取（`app.vault.adapter.basePath`），换台机器就不同。
 技术文档放在 `09-Note4LLM/work/projects/<project>/`，同目录 `README.md` 维护文件索引。
 
 - frontmatter：`id`（`YYYYMMDDHHmm`）/ `title` / `slug` / `created`（`2026-09-17 17:06`）

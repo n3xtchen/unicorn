@@ -14,7 +14,7 @@ Create one self-contained note for one captured topic. A note may synthesize mul
 Write notes only to:
 
 ```text
-/Users/nextchen/Library/Mobile Documents/iCloud~md~obsidian/Documents/nextlink/00-InBox&FleetNote/
+<vault>/00-InBox&FleetNote/
 ```
 
 Do not move, rename, reorganize, or edit any existing note unless the user explicitly asks.

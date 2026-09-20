@@ -29,7 +29,8 @@ const STATE_DIR = path.join(
 
 const OBSIDIAN_BIN = process.env.DJ_OBSIDIAN_BIN || "obsidian";
 const OBSIDIAN_PROC_RE = process.env.DJ_OBSIDIAN_PROC_RE || "MacOS/Obsidian$";
-const DEFAULT_VAULT = "nextlink";
+// 本机特定的配置一律走环境变量，不写死在逻辑里。
+const DEFAULT_VAULT = process.env.DJ_VAULT || "nextlink";
 
 // parseArgs 的结果在 main 里落到这里，供不接 args 的调用点（如 runProofread）取用。
 let CLI_ARGS = {};
@@ -1736,7 +1737,7 @@ function main() {
         "  审计:",
         "    --audit --from=YYYY-MM-DD --to=YYYY-MM-DD",
         "  通用:",
-        "    --vault=<库名>            默认 nextlink",
+        "    --vault=<库名>            默认 $DJ_VAULT，再默认 nextlink",
         "    --registry=<路径>         registry.json 实例；默认按 vault/状态目录探测",
         "    --rebuild-registry        重新生成 registry（缺失时也会自动重建）",
         "    --path=<库内相对路径>     默认由 daily:path 得到",
