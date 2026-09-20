@@ -46,7 +46,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 
 1. **原文不得擅自改写（R3）.** Never paraphrase, reorder, reformat, dedent, or "improve" the user's text. 照抄时逐字节照抄，**包括** `==highlights==`、Tab 缩进、以及打错的字。没有时间戳前缀。
    R3 拦的是「擅自」—— 你自己动笔改就违反。两道**授权**改写也走脚本，不走你手写：`--fix-pair`（第 2 步查出、用户点头才改，是**闸门**）与 `--fix-written`（用户事后点名要改，是**例外**）。
-2. **默认 dry-run（D3）.** Show the diff first. Only run with `--write` after the user confirms. dry-run 不落盘、也**不创建**当日笔记：笔记不存在时直接报 `note-not-found`，要建它必须显式加 `--write`。
+2. **默认 dry-run（D3）.** Show the diff first. Only run with `--write` after the user confirms. dry-run 不落盘、也**不创建**当日笔记：笔记不存在时直接报 `note-not-found`（默认当日路径要建它得显式加 `--write`，或先跑 `scripts/journal_create.sh`；显式 `--path` 指向的文件脚本一律不建）。
 3. **不确定就问（D5）.** If the classification, the anchor, or the target note is uncertain, stop and ask. Never guess and never silently leave something `unsorted`.
 4. **Never touch `### 关联笔记`** (the dataviewjs block), the tasks blocks, or any other note.
 5. **No filesystem fallback.** If Obsidian is not running, stop and tell the user. Do not write the file directly — that would clobber unsaved editor content.
@@ -314,14 +314,16 @@ scripts/journal_apply.mjs --fix-written --id=20260916-1549-0882 --replace='便�
 | `pre-write-verify-failed` | A verbatim/idempotency check failed. Nothing was written. Report the failed flag. |
 | `orphan-index-markers` | The derived-layer markers are half-present. Ask the user before repairing. |
 | `index-markers-missing` | `jc:index` 标记整块缺失。不要自己补，先看库内实际状态再问用户。 |
-| `note-not-found` | 当日笔记不存在。dry-run 只报不建；跑 `journal_create.sh`，或确认后加 `--write` 让捕获路径建它。 |
+| `note-not-found` | 当日笔记不存在。dry-run 只报不建；跑 `scripts/journal_create.sh`，或确认后加 `--write` 让捕获路径建它。显式 `--path` 指向的文件脚本不会建，加 `--write` 也不行。 |
 | `file-missing` | 目标笔记在写入瞬间消失了。查 vault 状态后重跑，不要回退到文件系统写入。 |
 | `--links 必须是纯 wikilink 列表` | 关联列只放链接。`问题：` 后面写明是「含换行」「\| 没有转义」「有裸文字」还是「一个 wikilink 都没有」（退出 7）。 |
 | `--links 里有库里找不到的目标` | 链接指向不存在的笔记。去掉它，或先把对应笔记建好（退出 7）。 |
 | `--fix-pair 没有命中` | 对里的左值在原文里找不到 —— 通常意味着模型读错了原文。核对后重来，不要默默放过。 |
 | `readback-mismatch` | Something else wrote to the note concurrently. Stop and inspect. |
 | `concurrent-edit` | 读盘到写盘之间 Obsidian 里改过这条笔记，已放弃落盘。重跑即可，不要强行覆盖。 |
-| `obsidian CLI 超过 ... 无响应` | Obsidian 侧偶发无响应，子进程已被杀（退出 4）。重跑通常即可；连续出现就重启 Obsidian，或调 `DJ_TIMEOUT_MS`。 |
+| `obsidian CLI 超过 ... 无响应` | Obsidian 侧偶发无响应，本脚本按 `DJ_TIMEOUT_MS` 超时杀子进程（退出 4）。重跑通常即可；连续出现就重启 Obsidian。 |
+| `obsidian CLI 子进程被 ... 终止` | **不是超时** —— 子进程被 SIGKILL/SIGTERM 杀掉，多为 Obsidian 崩溃或被系统回收内存（退出 4）。先重跑一次；反复出现请重启 Obsidian 并看崩溃报告，别说成「偶发抖动」。 |
+| `--fix 指定的项不存在或不可机械修正` | `--fix=f1,f5` 里的 id 没落到实际替换（不存在，或该项 `autoFix: false`，如 `highlight-unclosed`）。看 `--proofread` 输出的可用 id 重选；`safe` / `all` 不受影响（退出 1）。 |
 | `回代校验失败` | `--fix-written` 的右值在原文里本来就出现过，替换会互相干扰。换更长的上下文再试，不要用会撞车的对。 |
 | `块外内容被牵连` | 脚本 bug，已中止未落盘。把现场给用户看，不要自己绕过去。 |
 | `迁移后不合法` / `迁移后出现词表外的新标签` | `--migrate-tags` 会被拦下。用 `--map` 指定映射，或先问用户再 `--allow-new-tag`。 |

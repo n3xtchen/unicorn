@@ -409,12 +409,12 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 只是静默地什么都不做。这类 bug 比崩溃难发现得多，靠的只能是把验收写死在测试里。
 
 - **R1 · `--audit` 搜的是不存在的字符串。** 搜索目标是字面量 `unsorted/-`，而派生层里写的是
-  占位标签 `#unsorted`（`:946` 的 `PLACEHOLDER_TAG`）。两边从改名标签那天起就对不上，
+  占位标签 `#unsorted`（脚本里的 `PLACEHOLDER_TAG` 常量）。两边从改名标签那天起就对不上，
   `--audit` 永远返回 0 行，却一直显示「正常」。改法：不再匹配整行字面量，而是**拆出分类列
   再按标签比对**（复用 `PLACEHOLDER_TAG`，经 `P.tag` 传进 payload）。
-- **R2 · `--migrate-tags` 不认 `--allow-new-tag`。** 写盘路径（`:1943`）早就允许「先问用户、
-  用户点头后带旗标放行」，迁移路径却一律 `fail` —— 同一条 D5 规则两个入口两种口径。改法：
-  迁移路径对齐写盘路径，`&& !args["allow-new-tag"]`。
+- **R2 · `--migrate-tags` 不认 `--allow-new-tag`。** 写盘路径（读 `args["allow-new-tag"]` 的那
+  一支）早就允许「先问用户、用户点头后带旗标放行」，迁移路径却一律 `fail` —— 同一条 D5 规则
+  两个入口两种口径。改法：迁移路径对齐写盘路径，`&& !args["allow-new-tag"]`。
 - **R3 · 空内容能过五项校验。** `bodyExact` 用的是 `after.indexOf(P.content) >= 0`，
   而 `indexOf("") === 0` —— **空串恒真**，所以空内容能一路混过 pre-write-verify。
   两层都补：CLI 侧 `content.trim() === ""` 直接退出 1（与校对里 `empty` 是 blocking 同一口径），
@@ -511,4 +511,7 @@ id 的时间段用紧凑 `HHmm`（不带冒号）；「时间」列的展示形�
 - **捕获路径没有字节级备份。** `--fix-written` / `--migrate-tags` / `--verify-ids --write` 都会先写
   `<vault>/.daily-journal/backup/`，唯独立 capture 走 `app.vault.process()` 直接替换、不留 `.bak`
   （W6 只覆盖「改写已有原文」，capture 是追加）。要不要给捕获路径也补备份待定。
+- **JS 侧超时杀不到孙进程。** `execFileSync` 超时只能杀 `obsidian` CLI 本身，杀不到它派生的孙进程
+  （Node 的 `spawnSync` 不暴露 pid，做不到 `kill(-pgid)`）；两个 shell 入口已用 `kill_tree` 递归补齐。
+  要不要改成自己管进程组，取决于 obsidian CLI 是否真的 fork，待定。
 - 合并 `productivity/docker.md`、`productivity/mermaid.md` 时的源文件被移到 `<vault>/.trash/`，等用户确认后可清空。
