@@ -46,7 +46,12 @@ Read [the decision log](references/decision-log.md) when changing this skill or 
 11. **提交前先对齐代码与文档。** 本次变更动了代码行为（接口、退出码、失败信息、默认值、校验口径等）时，提交前核对该模块文档是否仍与代码一致：skill 的 `SKILL.md` 条款与失败表、`references/decision-log.md` 的决策与验收项、`--help` 文本、README/CHANGELOG 等。确认属于本次变更的文档要对齐后与代码放进**同一个 Commit**，标题概括共同目标、正文说明同步了哪些文档；只有变更本身是纯文档工作，才单独提 `docs(...)`。
 12. **归属判不清就先问，不要强行对齐。** 判断某份文档是否由本次变更负责，需要三条都成立：同一目录或模块；文档里明确提到被改的符号、条款或行为；git 历史中曾与该代码一起提交。三条不齐就当作不确定：不改那份文档，把缺口单列出来向用户确认，宁可留着缺口也不动职责范围不清的文档。
 13. 需要执行 `git commit` 或 `git commit --amend` 时，提交标题与正文必须使用真实换行。优先使用带单引号分隔符的 quoted heredoc（例如 `git commit -F- <<'EOF'`），不要在普通字符串中使用 `\n` 拼接正文；否则 `\n` 会被原样写入 Commit message，`git log` 里显示成字面量 `\n`（一个反斜杠加 `n`），而不是真换行。
-14. 提交或 amend 后，必须用 `git log -1 --format='%B'` 检查正文排版，并搜索是否存在字面量 `\n`，例如 `git log -1 --format='%B' | grep -F '\n'`；必要时用 `git cat-file -p HEAD` 或十六进制检查确认实际换行。除非用户明确要求，不自动执行 `git commit`，只生成或修改提交信息。
+14. 提交或 amend 后，必须用 `git log -1 --format='%B'` 检查正文排版，并搜索是否存在字面量 `\n`，例如 `git log -1 --format='%B' | grep -F '\n'`；必要时用 `git cat-file -p HEAD` 或十六进制检查确认实际换行。
+15. **执行 `git commit` 或 `git commit --amend` 前默认先向用户确认。** 默认只生成或修改提交信息，不自动提交；即使用户已要求提交，也要先摆出两件事再等授权：
+    - 将要提交的内容：`git status --short` 与 `git diff --cached --stat`，必要时附关键 diff；
+    - 将要使用的完整 Commit 信息：标题和正文按原样给出，不要只给摘要。
+
+    只有用户明确同意后才执行提交。唯一例外是用户在本次请求里明确说了“不用授权 / 直接提交 / 不用再确认”，此时才可以跳过确认，但仍需遵守第 11～14 条。
 
 ## 输出要求
 
@@ -56,6 +61,7 @@ Read [the decision log](references/decision-log.md) when changing this skill or 
 - 如果仓库历史同时存在中文前缀（例如“文档：”）和 Conventional Commits，默认优先使用仓库近期、目标模块更常见的格式。
 - 不为了追求中文而翻译已经约定俗成的技术标识，也不把英文技术术语误判为英文 Commit 风格。
 - 如果本次变更动了代码却缺对口文档，先指出缺口并询问，不要默认把文档留到下一个 Commit。
+- 任何 `git commit` / `git commit --amend` 之前先等用户授权，并在请求里同时给出“提交内容摘要”与“将使用的完整 Commit 信息”；未授权就停在文案阶段。
 
 ## 示例
 
