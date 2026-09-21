@@ -1,6 +1,6 @@
 ---
 name: daily-journal
-description: Capture text verbatim into today's Obsidian daily journal (02-Done), then classify and link it in an agent-maintained derived layer; also captures tasks into a separate mutable 今日待办 layer, and can propose todo candidates spotted inside a thought for the user to confirm. Use when the user asks to 记一下、记录一下、追加到今天的日记、capture/journal this, hands over a thought to be kept for today, asks to 记个待办、加个任务、提醒我做某事（task/todo capture）, or asks to 把待办挑出来、这段里有没有待办、提取待办（todo extraction）.
+description: Capture text verbatim into today's Obsidian daily journal (02-Done), then classify and link it in an agent-maintained derived layer; also captures tasks into a separate mutable 今日待办 layer, including todo candidates spotted inside a captured thought (written together with the capture by default, unless the user opts out). Use when the user asks to 记一下、记录一下、追加到今天的日记、capture/journal this, hands over a thought to be kept for today, asks to 记个待办、加个任务、提醒我做某事（task/todo capture）, or asks to 把待办挑出来、这段里有没有待办、提取待办（todo extraction）.
 ---
 
 # Daily Journal Capture
@@ -46,7 +46,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 
 1. **原文不得擅自改写（R3）.** Never paraphrase, reorder, reformat, dedent, or "improve" the user's text. 照抄时逐字节照抄，**包括** `==highlights==`、Tab 缩进、以及打错的字。没有时间戳前缀。
    R3 拦的是「擅自」—— 你自己动笔改就违反。两道**授权**改写也走脚本，不走你手写：`--fix-pair`（第 2 步查出、用户点头才改，是**闸门**）与 `--fix-written`（用户事后点名要改，是**例外**）。
-   **R3 的射程是 `jc` 原文层**（D19）。`## 今日待办`（`jt` 区）是另一层、天然可变：勾选、改期、拖动、删除全归用户，不受 R3 与 `--fix-written` 的 `--id` 限制约束。两个例外不变：内容仍逐字节来自用户，转换由你提出、用户点头。
+   **R3 的射程是 `jc` 原文层**（D19）。`## 今日待办`（`jt` 区）是另一层、天然可变：勾选、改期、拖动、删除全归用户，不受 R3 与 `--fix-written` 的 `--id` 限制约束。原文层的内容仍逐字节来自用户；`jt` 层的任务行**允许改写原句**（删「要」、调语序），两档默认不同：**从捕获内容里顺手提出的待办默认直接写入**（第 7 步，除非用户说不写），**用户直接交办的待办与回溯提取仍要点到最终文字**。
 2. **默认 dry-run（D3）.** Show the diff first. Only run with `--write` after the user confirms. dry-run 不落盘、也**不创建**当日笔记：笔记不存在时直接报 `note-not-found`（默认当日路径要建它得显式加 `--write`，或先跑 `scripts/journal_create.sh`；显式 `--path` 指向的文件脚本一律不建）。
 3. **不确定就问（D5）.** If the classification, the anchor, or the target note is uncertain, stop and ask. Never guess and never silently leave something `unsorted`.
 4. **Never touch `### 关联笔记`** (the dataviewjs block), the tasks blocks, or any other note.
@@ -224,7 +224,7 @@ Re-run the same command with `--write`. Confirm the output says `status: written
 
 ### 7. Report back
 
-Tell the user: the target path, the block `id`, the chosen tag(s), which candidate you picked (or that the tag is newly invented), and any candidate you had to break a tie between. If the captured text contained anything that looked like a todo, also 走「待办提取」那节 —— 把候选待办一并摆给他判断，等他逐条点头再写。
+Tell the user: the target path, the block `id`, the chosen tag(s), which candidate you picked (or that the tag is newly invented), and any candidate you had to break a tie between. If the captured text contained anything that looked like a todo, also 走「待办提取」那节 —— **默认与那段思考一起写进去**（`--kind=todo`），并**把写进去的行逐条列在回报里**，让他一眼能核、一行能删；只有用户明确说过不写时才跳过（跳过也要说明）。
 
 ## Repeating
 
@@ -259,7 +259,9 @@ scripts/journal_apply.mjs --kind=todo --content-file=/tmp/dj-todo.txt --write   
 固定节序：**思考 → 待办 → 派生 → 关联**。待办节不存在时由 skill 建在派生层之前；
 被用户拖到派生层之后时视为**不存在**（退回改动前的行为，不报错）。
 
-### 逐条确认，不静默加工
+### 用户交办的待办：逐条确认，不静默加工
+
+（从**捕获内容里顺手提出的**待办是另一回事 —— 那一条默认直接写入，见「待办提取」那节。）
 
 - 每行都要是**一行 checkbox**。用户给的是「明天交房租」这种口语，**你转成任务行之前要先给他看**，
   别默默把口语改成 `- [ ]`。这跟 R3 同一个立场：转换由你提出、用户点头。
@@ -303,17 +305,25 @@ scripts/journal_apply.mjs --kind=todo --content-file=/tmp/dj-todo.txt --write   
 - 只有一部分重复 → 报 `task-line-duplicate`，退出 6，**不静默跳过重复行** ——
   否则用户以为三条都记上了，实际只落两条。
 
-## 待办提取：从已有内容里挑待办（提案，不落盘）
+## 待办提取：从内容里挑待办
 
-上面那节是**你直接把待办交给我**；这节是**内容里藏着待办，我挑出来交给你**。
-方向反过来：我只管提案，一个字也不写。
+上面那节是**你直接把待办交给我**；这节是**内容里藏着待办，我挑出来**。两个触发，**默认不同**：
 
-两个触发：
+| 触发 | 默认 | 为什么不一样 |
+| --- | --- | --- |
+| **捕获思考时顺手扫一遍**（工作流第 7 步） | **直接写进去**，与那段思考同批落进 `jt` 层 | 用户 2026-09-21 定调：「写日志的时候，如果有待办，也一起写，除非我明确说不写」 |
+| **回溯已有日记**（「把今天的待办挑出来」） | **只提案，不落盘** | 翻的是旧内容，改动面比当次捕获大；用户没点名要写就一个字不动 |
 
-1. **捕获思考时顺手扫一遍**。内容已经过你的手，扫一眼不额外花什么。
-2. **回溯已有日记**：用户说「把今天的待办挑出来」「这段里有没有待办」。读 `02-Done/` 里对应笔记就行（如 `obsidian vault=nextlink read path=...`），**只读不改**。
+回溯触发读 `02-Done/` 里对应笔记即可（如 `obsidian vault=nextlink read path=...`），**只读不改**。
 
-### 提案长什么样
+**捕获路径的唯一开关是用户的一句话。** 他说过「这次别记待办」「不用提取」，就跳过并回报一句「按你说的没提取待办」。
+不新增旗标、不落配置 —— 这是**口径**，不是模式。
+
+**同一批、同一轮确认。** D3 的 dry-run 与「用户点头」并没有被取消，取消的只是「为待办**单独**再等一轮」：
+思考块与待办行可以一次看完（两条命令各出一份 diff），落盘也在同一次「写」里完成，
+回报里把两边的结果一并列出。
+
+### 提案长什么样（回溯那一档）
 
 ```text
 刚记下的内容（原文已落入 20:00 块 `20260920-2000-a1b2`）：
@@ -330,7 +340,9 @@ scripts/journal_apply.mjs --kind=todo --content-file=/tmp/dj-todo.txt --write   
 ```
 
 然后**停下来等**。用户回「1、3 要，日期都对，2 不要」之后，才用那几句话去跑 `--kind=todo`。
-他没回，就只留原文 —— 提案是只读的，没写任何东西。
+他没回，就只留原文 —— 这一档是只读的，没写任何东西。
+
+（捕获那一档不走这张表：默认已经写完了，回报里给的是**已落盘的行**，不是待选项。）
 
 ### 提什么，不提什么
 
@@ -341,17 +353,22 @@ scripts/journal_apply.mjs --kind=todo --content-file=/tmp/dj-todo.txt --write   
 **拿不准就不提，或者只问一句**（D5）。宁少勿多：把一句感慨提成待办比漏掉一条更难看，
 而且用户还要花时间否掉它。
 
-一句话能拆出多条时，**默认拆开列**并标出是你拆的 —— 用户合并比拆错容易。
+**默认写入不降门槛**：正因为捕获那一档没有「写前确认」这道人工闸，这里的「宁少勿多」是**唯一**的准入门槛，
+一个字也不能松。漏一条待办用户下次提起来就行；多写一条感慨，用户得自己动手删。
+
+一句话能拆出多条时，**默认拆开**并标出是你拆的 —— 用户合并比拆错容易。捕获那一档直接拆成多行写进去，回溯那一档拆成多行列进表里。
 
 ### 硬约束
 
 - **原文一个字不动**（R3 / D19）。提取是在 `jt` 层新建行，不是在 `jc` 层编辑。
   原文里的「明天要交房租」原封不动留着，新行是另一条独立存在的描述。
-- **允许改写原句来造任务行**，但**必须逐条给用户看最终文字** ——
-  「明天要交房租」→ `- [ ] 交房租 📅 2026-09-21`，删了「要」、语序也动了。
-  `jt` 层不受 R3 约束，但文字毕竟还是用户的，所以还是回到同一句话：**转换由你提出、用户点头**。
-- **日期仍然不猜**（D24）。提案里给**建议值**并标出源词（「明天」「周四前」），
-  用户确认后才写。落盘时如果需要机械替换，走 `--fix-pair`。
+- **允许改写原句来造任务行**（删「要」、调语序：「明天要交房租」→ `- [ ] 交房租 📅 2026-09-21`）。
+  文字毕竟还是用户的，所以两档收口不同：**捕获路径**默认直接写，代价是回报时**逐条列出最终文字**；
+  **回溯路径**仍要点到**最终文字**那一级再写。`jt` 层不受 R3 约束，写错一条也就是删一行。
+- **日期仍然不猜**（D24）。`明天` / `下周三` / `三天后` 会被脚本报 `task-date-relative` 并**阻断落盘**，
+  所以「默认写入」不会顺手把日期也替你定了 —— 遇到相对时间就**回来问一句**，给建议值并标出源词（「明天」= 笔记日期 +1），
+  用户确认后走 `--fix-pair` 落地。
+- **捕获路径里，日期这一步必然额外多一次往返**：闸门拦着，所以别把相对时间的行塞进 `--write` 硬撞，撞了就是退 1 不落盘。
 - **提案里的行也要先过闸门**。提取出的行和直接给的待办走**同一条** `--kind=todo` 通道，
   同样过校对项与五项写入校验；不确定就先 dry-run 看一眼。
 
