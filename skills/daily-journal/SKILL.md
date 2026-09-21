@@ -48,7 +48,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
    R3 拦的是「擅自」—— 你自己动笔改就违反。两道**授权**改写也走脚本，不走你手写：`--fix-pair`（第 2 步查出、用户点头才改，是**闸门**）与 `--fix-written`（用户事后点名要改，是**例外**）。
    **R3 的射程是 `jc` 原文层**（D19）。`## 今日待办`（`jt` 区）是另一层、天然可变：勾选、改期、拖动、删除全归用户，不受 R3 与 `--fix-written` 的 `--id` 限制约束。原文层的内容仍逐字节来自用户；`jt` 层的任务行**允许改写原句**（删「要」、调语序），两档默认不同：**从捕获内容里顺手提出的待办默认直接写入**（第 7 步，除非用户说不写），**用户直接交办的待办与回溯提取仍要点到最终文字**。
 2. **默认 dry-run（D3）.** Show the diff first. Only run with `--write` after the user confirms. dry-run 不落盘、也**不创建**当日笔记：笔记不存在时直接报 `note-not-found`（默认当日路径要建它得显式加 `--write`，或先跑 `scripts/journal_create.sh`；显式 `--path` 指向的文件脚本一律不建）。
-3. **不确定就问（D5）.** If the classification, the anchor, or the target note is uncertain, stop and ask. Never guess and never silently leave something `unsorted`.
+3. **不确定就问（D5）.** 分类、链接、来源、落点**任何一环**拿不准，先问用户，再落盘。不猜、不静默降级、不自行决定。`#unsorted` 只是占位符、**不是终点**：落占位的同时必须列出候选并当场提问。除非用户明确要求「全自动、不要问我」，本条不可关闭。
 4. **Never touch `### 关联笔记`** (the dataviewjs block), the tasks blocks, or any other note.
 5. **No filesystem fallback.** If Obsidian is not running, stop and tell the user. Do not write the file directly — that would clobber unsaved editor content.
 6. **校对是独立的一步（R3 的补充）.** 你只能在用户**明确确认后**，用脚本对原文做**机械替换**；绝不自己改写。原文层最终收到的，是用户批准的那个版本。详见第 2 步。
@@ -487,7 +487,7 @@ scripts/journal_apply.mjs --migrate-tags --map='life/HomeLab→life' --write
 
 ## 迁移派生层的块 id 成块链接
 
-派生层（见 `references/decision-log.md` C12/C13）的「块 id」列写的是**可点的块链接**：
+派生层的「块 id」列写的是**可点的块链接**（D28）：
 
 ```markdown
 | 时间 | 块 id | 分类 | 关联 |
@@ -591,3 +591,20 @@ Edit the 「分类」 column in the derived layer directly — it holds bare tag
 旧日记里可能还留着裹反引号的旧格式（`` `work/sales` ``），那不是标签，不会进图谱。**不要手改**，用 `--migrate-tags`（见上一节）。
 
 「块 id」列同理：它是可点的块链接，**不要**改回裹反引号的旧形态；历史笔记里还留着的旧形态用 `--link-block-ids` 补。
+
+## 维护本 skill：迭代工作区与上提（D27）
+
+改本 skill 时，设计材料分两侧，**结论只有一份**：
+
+| 位置 | 装什么 | 读它是为了 |
+| --- | --- | --- |
+| 本仓库（git） | 规格（本文件）、决策条文（`references/decision-log.md`）、库约定（`references/vault-conventions.md`）、`scripts/`、`tools/` | 「做」与「定」 |
+| vault 迭代页 `09-Note4LLM/productivity/projects/<YYYYMMDD>-<主题>/` | 本轮的过程：现状核对、设计稿、否决理由、实测草稿、工程史与验收证据、开放项、指针 | 「信」（当时怎么试的、怎么验的） |
+
+判据一句话：是「现在是什么」→ 仓库；是「为什么、怎么试的、还没定」→ vault。
+
+**定稿即提（不攒批）。** 一条口径定稿就搬进仓库 —— 设计决策追加进 `decision-log.md` 的 D 系列（编号一次分配、**永不重排**；被替代的条目不删，写明它被谁替代），实现口径并进本文件或 `vault-conventions.md`；随即把 vault 侧那段的**结论正文删掉、压成一行指针**。过程叙事留 vault，结论不两边各存一份：两边同存正文必然分叉（vault 自称「唯一权威」、仓库头部又指回 vault 的那次互指，就是这么来的）。
+
+**vault 不是 git 仓库**（误删只有 Obsidian File Recovery 一条路），所以不可重建的东西 —— 决策条文、验收证据 —— 一律留在仓库；vault 侧只放过程、指针与验收**结果**。
+
+**新开一轮迭代**：在 vault 建 `projects/<YYYYMMDD>-<主题>/README.md` 当迭代页即可，仓库侧**零准备动作**（不建 CHANGELOG、不开分支）。迭代收口时把批次账写进 vault 的 release note；未完成的跨迭代项转进 `10-GTD/me.md`；仓库 `decision-log.md §遗留` 只留「已知缺口 + 重开条件」这类结论，不留行动项。
