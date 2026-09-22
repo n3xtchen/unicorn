@@ -158,3 +158,22 @@ MD060 判定的是「同一张表内风格一致」，且**按显示宽度比较
 - 自检命令与 lint 并列执行，见 SKILL.md「正文语气（去 AI 化）」。
 
 来源：2026-09-18 ～ 09-21 编辑 `2026-09-14` 周报（Team + TL）时用户连续指出四类句式（计数式开篇、对偶句、问答式总结、并列段落同一句式）。
+
+## D9 · 任务行规范的权威在 daily-journal，本 skill 只放判据与指针
+
+**状态：已定论（2026-09-22，用户口径）；含一处解耦待办，见文末。**
+
+用户口径：任务行这套能不能当作写 markdown 的通用规范 —— 答复是把与 .md 直接相关的那几条写进本 skill，契约正文不搬。
+
+执行口径：
+
+- 本 skill 管四条判据：行尾只能是一个 emoji 字段、字段顺序固定（描述 → 行内标签 → 优先级 → `➕` → `🛫` → `⏳` → `📅` → `🔁` → `✅`）、一行一个 checkbox 且子项缩进 4 空格、手写任务行自带 `➕`；配一条 `rg` 自检，因为 markdownlint 没有任何规则管任务行。
+- 权威不在本 skill：待办行语法契约在 `daily-journal/references/vault-conventions.md`，对齐的是库内插件的 `.obsidian/plugins/obsidian-tasks-plugin/data.json`（`taskFormat: tasksPluginEmoji`、`setCreatedDate: true`）。状态词表、`jt` 层、`--fix-pair` 闸门、出处链接位置都留在那份契约里，不复制。
+- 为什么要写进本 skill：插件配置的 `globalQuery` 是 `path does not include 998-template`，除模板目录外的任务行都会被查询扫到 —— 项目笔记、调研笔记里写 `- [ ]` 的人同样会踩，不只写日记的人。
+- 对照 D8：去 AI 化与工具无关，权威在本 skill；任务行格式绑定库内插件配置，属 vault 专属，权威留在 vault 侧 skill，方向相反。
+
+来源：2026-09-22 在 vault 项目笔记里写待办时，只读了 daily-journal 的 SKILL.md、漏掉 `references/vault-conventions.md` 的语法契约，四条任务行全缺 `➕`，被用户点名。
+
+补记（同日晚些时候，用户口径）：任务行规范不该由 markdown 侧依赖 dj，原话「task规范 markdown 不应该依赖 dj」。上面那条指针是待改掉的一端，解耦方向（把契约上提到本 skill，或抽成两不依赖的第三处）留下次迭代定：
+
+- [ ] 把任务行规范从 daily-journal 解耦，markdown 侧不依赖 dj ➕ 2026-09-22
