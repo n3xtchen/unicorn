@@ -502,24 +502,14 @@ const FILES_PAYLOAD = String.raw`
   const P = globalThis.__DJ_P;
   const all = [];
   const paths = [];
-  const aliases = [];
   const files = app.vault.getFiles();
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     all.push(f.basename);
     paths.push(f.path);
-    if (f.extension === "md") {
-      paths.push(f.path.slice(0, f.path.length - 3));
-      let c = null;
-      try { c = app.metadataCache.getFileCache(f); } catch (e) { c = null; }
-      const al = c && c.frontmatter ? c.frontmatter.aliases : null;
-      if (al) {
-        const list = Array.isArray(al) ? al : String(al).split(",");
-        for (let k = 0; k < list.length; k++) aliases.push(String(list[k]).trim());
-      }
-    }
+    if (f.extension === "md") paths.push(f.path.slice(0, f.path.length - 3));
   }
-  return JSON.stringify({ ok: true, all: all, paths: paths, aliases: aliases });
+  return JSON.stringify({ ok: true, all: all, paths: paths });
 })()
 `;
 
@@ -1174,8 +1164,12 @@ function buildLinkIndex(listed) {
   // 按 Obsidian 的真实解析规则建立索引：
   //   - 文件名（basename）
   //   - 全路径（带/不带 .md）
-  //   - frontmatter aliases
   // 少了任何一类都会把合法链接判成坏链接（实测路径式链接占误报的绝大多数）。
+  //
+  // **frontmatter aliases 不算可解析目标**（2026-09-21 实测，见 D34）：曾把 aliases 也加进
+  // targets，于是 [[04-决策记录]] 这种「别名链接」能通过闸门、写进关联列后在库里是**死链**。
+  // 实测口径：候选 51 个别名，getFirstLinkpathDest() 只解析出 6 个，且这 6 个都是别名
+  // 恰好等于某个真文件名（Transformer / python→Python.md …），没有一个靠别名本身解析成功。
   const targets = new Set();
   const names = new Map();
   for (const b of listed.all) {
@@ -1185,7 +1179,6 @@ function buildLinkIndex(listed) {
     if (!names.has(k)) names.set(k, b);
   }
   for (const p of listed.paths) if (p) targets.add(p.toLowerCase());
-  for (const a of listed.aliases) if (a) targets.add(a.toLowerCase());
   return { targets: targets, names: names };
 }
 
@@ -3160,7 +3153,7 @@ function main() {
         "--links 里有库里找不到的目标：" + lc.missing.map((t) => "[[" + t + "]]").join("、") +
           "\n  关联列只允许链真实存在的文件（没有实际文档，关联就没有意义）。" +
           "\n  要么去掉这些链接，要么先把对应笔记建好。" +
-          "\n  （解析规则同 Obsidian：全路径/文件名/frontmatter aliases 都算命中）",
+          "\n  （解析规则同 Obsidian：全路径/文件名算命中；frontmatter aliases **不算** —— 实测别名不是链接目标，见 D34）",
         7,
       );
     }
