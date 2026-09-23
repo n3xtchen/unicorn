@@ -52,13 +52,41 @@ const SECTIONS = {
 // 五项校验全绿，没有任何机械守卫能拦住 —— 只能靠这里取对值。
 const DAILY_BASENAME_RE = /^(\d{4})-(\d{2})-\d{2}w-(\d{2})$/;
 
-// 块尾锚点 ` ^<块 id>`，钉在正文最后一行的末尾，让 [[笔记#^id]] 能跳到这段思考。
+// 锚点两种，都挤在**正文字里**（不另起一行），让 [[笔记#^id]] 跳得回来：
+//   块锚点 ` ^<块 id>`         —— 钉在正文最后一行，代表「这一整条思考」
+//   行锚点 ` ^<块 id>-<行号>`  —— 钉在块内任意一行（D35），代表「那句话本身」：
+//                                 待办的 `↩` 要跳到具体哪一句时，按需给那一行补一个
 // Obsidian 只认落在一段**真文本**里的锚点（整行只有 ^id，或跟在别的字后面都行）；
 // HTML 注释行认不认没实测过，不赌它，所以锚点不挂在 <!-- jc:end … --> 上，只挤进正文。
 // 代价与口径：**锚点不算正文** —— 算 sha1、比对幂等之前一律先剥掉，
 // 否则锚点里的 id 会自指进 hash（id 是 sha1(正文)，锚点又是 id）。
-const TAIL_ANCHOR_RE = / \^[A-Za-z0-9._-]+$/;
-const stripTailAnchor = function (s) { return s.replace(TAIL_ANCHOR_RE, ""); };
+// 剥法按形状限死（<8位日期>-<4位时刻>-<4位 hash>[-行号]），
+// 免得把正文里碰巧以 ` ^词` 结尾的句子当成锚点剥掉。
+const ANCHOR_RE = / \^(\d{8}-\d{4}-[0-9a-f]{4})(?:-(\d+))?$/;
+const isAnchorId = function (s) { return /^\d{8}-\d{4}-[0-9a-f]{4}(?:-\d+)?$/.test(s); };
+// 逐行剥锚点 —— 不止尾巴那一个：块内每一行都可能挂着一个行锚点。
+const stripAnchors = function (s) {
+  return String(s).split("\n").map(function (ln) { return ln.replace(ANCHOR_RE, ""); }).join("\n");
+};
+// 块内所有锚点：{ at: 行下标(0 基), id, lineNo: 行锚点的行号或 null, token: 原样串 }
+const anchorsInBody = function (body) {
+  const out = [];
+  const lines = String(body).split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(ANCHOR_RE);
+    if (m) out.push({ at: i, id: m[1], lineNo: m[2] === undefined ? null : Number(m[2]), token: m[0] });
+  }
+  return out;
+};
+// 换块 id：块内每个锚点跟着换前缀，各自的行号位保留。
+// 行号**不在这里重编号**（那会静默把链接指到别的一句话上）—— 漂没漂由 --verify-ids 报出来。
+const retokenAnchors = function (body, newId) {
+  return String(body).split("\n").map(function (ln) {
+    const m = ln.match(ANCHOR_RE);
+    if (!m) return ln;
+    return ln.slice(0, ln.length - m[0].length) + " ^" + newId + (m[2] === undefined ? "" : "-" + m[2]);
+  }).join("\n");
+};
 
 // ---------------------------------------------------------------------------
 // 基础工具
@@ -191,7 +219,7 @@ const WRITE_PAYLOAD = String.raw`
   };
   // 落盘前先拿 Node 算的 len/sum 自查（C11）：载荷在 code= 入参上被改写就一个字都不写。
   // 字段顺序必须与 Node 侧 captureStampSrc() 逐字对应；捕获通道由此不再只剩「字符串相等」一层。
-  const stampSrc = [P.content, P.anchor, P.id, P.time, P.noteDate, P.createdDateSource, P.category, P.links, P.sections.thinking, P.sections.todo, P.sections.derived, P.sections.related].join("\u0000");
+  const stampSrc = [P.content, P.anchor, P.anchorLine, P.id, P.time, P.noteDate, P.createdDateSource, P.category, P.links, P.sections.thinking, P.sections.todo, P.sections.derived, P.sections.related].join("\u0000");
   if (stampSrc.length !== P.stampLen || sumOf(stampSrc) !== P.stampSum) {
     return JSON.stringify({
       ok: false,
@@ -237,10 +265,12 @@ const WRITE_PAYLOAD = String.raw`
   const idxBeginRe = /^<!--\s*jc:index:begin\s*-->$/;
   const idxEndRe = /^<!--\s*jc:index:end\s*-->$/;
   const norm = function (s) { return s.replace(/\s+$/, ""); };
-  const tailAnchorRe = / \^[A-Za-z0-9._-]+$/;
-  const stripTailAnchor = function (s) { return s.replace(tailAnchorRe, ""); };
-  // 比对正文（撞 id / 幂等）时先剥锚点：不剥，同一段思考第二次捕获就对不上，会被当新块重复写。
-  const bodyOf = function (arr) { return stripTailAnchor(arr.map(norm).join(NL).trim()); };
+  const anchorRe = / \^\d{8}-\d{4}-[0-9a-f]{4}(?:-\d+)?$/;
+  // 比对正文（撞 id / 幂等）时先剥锚点：块锚点不算正文；块里还可能挂着若干**行锚点**（D35），
+  // 也得逐行剥掉 —— 只剥尾巴的话，补过行锚点的块第二次捕获会被当成新块，甚至报 id-collision。
+  const bodyOf = function (arr) {
+    return arr.map(function (l) { return norm(l).replace(anchorRe, ""); }).join(NL).trim();
+  };
 
   // 落盘 / 读回是两条写入通道（思考 / 待办）共用的尾段。口径只能有一处，
   // 否则就会出现「写盘会并发守卫、另一条不会」这类两个入口两个口径的缺陷（D18）。
@@ -395,9 +425,13 @@ const WRITE_PAYLOAD = String.raw`
   const dup = blocks.find(function (b) { return bodyOf(b.body) === incoming; });
   if (dup) return JSON.stringify({ ok: true, status: "duplicate", path: P.path, id: dup.id, blockCount: blocks.length });
 
-  // 锚点是**纯追加**在正文最后一行末尾（不另起一行）：正文一个字节没动，
-  // bodyExact 仍按 P.content 找子串、恒命中。末不适合钉时 P.anchor 为空串（见 main 里的 tailAnchorBlocker）。
-  const anchoredContent = P.content + (P.anchor || "");
+  // 锚点（C10）是**纯追加在一行末尾**（不另起一行）：正文一个字节没动，
+  // 位置由 Node 侧算好（P.anchorLine）：新口径钉**第一行非空行** —— Obsidian 认的块范围只有那一行，
+  // 但渲染层会把带子项的列表项连同子项一起渲染，所以钉首行才能让 [[#^id]] 的预览给出整条；
+  // 钉末行只剩最深那条叶子（旧口径，verify 仍然认，旧块不回填）。钉不了时 P.anchor 是空串。
+  const cl = P.content.split(NL);
+  if (P.anchor && P.anchorLine >= 0 && P.anchorLine < cl.length) cl[P.anchorLine] = cl[P.anchorLine] + P.anchor;
+  const anchoredContent = cl.join(NL);
   const block = ["<!-- jc:begin id=" + P.id + " -->", ""].concat(anchoredContent.split(NL), ["", "<!-- jc:end id=" + P.id + " -->"]);
 
   const rawEndBase = derived >= 0 ? derived : related;
@@ -478,7 +512,7 @@ const WRITE_PAYLOAD = String.raw`
     marksBalanced: vBegin === vEnd,
     oneBlockAdded: vBegin === blocks.length + 1,
     hasNewBlock: after.indexOf(newBeginLine) >= 0,
-    bodyExact: P.content.length > 0 && after.indexOf(P.content) >= 0,
+    bodyExact: P.content.length > 0 && after.indexOf(anchoredContent) >= 0,
     originalsPreserved: originalsPreserved,
     blockInSection: newBeginAt > rawStart && newEndAt > newBeginAt && !strayH2
   };
@@ -1807,6 +1841,7 @@ function captureStampSrc(p) {
   return [
     p.content,
     p.anchor,
+    p.anchorLine,
     p.id,
     p.time,
     p.noteDate,
@@ -1974,12 +2009,12 @@ function cmdFixWritten(vault, args) {
 
       const oldId = id;
       // 锚点不算正文：算 hash 前先剥掉，否则锚点里的旧 id 会自指进新 hash。
-      const canonNew = stripTailAnchor(newBody);
+      const canonNew = stripAnchors(newBody);
       const newHash = crypto.createHash("sha1").update(canonNew, "utf8").digest("hex").slice(0, 4);
       const newId = id.slice(0, id.length - 5) + "-" + newHash;
-      // 锚点是 id 的副本，id 换了它就得跟着换。本来没有锚点的旧块不补 ——
-      // 借「改错字」顺手给别人的笔记换形状是另一件事，要另开通道。
-      const anchoredNew = canonNew === newBody ? canonNew : canonNew + " ^" + newId;
+      // 锚点是 id 的副本，id 换了它就得跟着换：块锚点与各行的行锚点一起换前缀（行号位保留）。
+      // 本来没有锚点的旧块不补 —— 借「改错字」顺手给别人的笔记换形状是另一件事，要另开通道。
+      const anchoredNew = retokenAnchors(newBody, newId);
 
       after =
         after.slice(0, sp.bStart) +
@@ -2569,32 +2604,53 @@ const ID_BEGIN_RE = /^<!-- jc:begin id=(\d{8}-\d{4}-([0-9a-f]{4})) -->$/;
 
 // 正文末尾适不适合钉锚点。
 //
-// 锚点是 **` ^<块 id>` 贴在正文最后一行的末尾**，不是单起一行 —— 单起一行 Obsidian 也认（整行就是 `^id`），
+// 锚点是 **` ^<块 id>` 贴在正文**某一行的末尾**，不是单起一行 —— 单起一行 Obsidian 也认（整行就是 `^id`），
 // 但那样锚点就不在正文里了，`--fix-written` 换 id 时会留下一个指向不存在块的死锚点。
-// 代价是「最后一行」必须真能接受尾巴，下面几类不能钉，宁可不钉也不弄坏原文：
-//   末行是表格行 -> 多出一个单元格，表格直接坏掉
-//   末行是代码围栏 / 正文末尾在未闭合的代码块里 -> 围栏作废，后面的原文全变代码
-//   末尾有空行 -> 锚点落到新起的一行上，Obsidian 不认（`^id` 得在段落开头或整行）
-function tailAnchorBlocker(body) {
-  if (String(body).trim() === "") return "块内没有正文";
-  if (/\n[ \t]*$/.test(body)) return "正文末尾有空行：锚点会落到新起的一行上，Obsidian 认不出来";
-  const lines = String(body).split("\n");
+// 代价是「那一行」必须真能接受尾巴，下面几类不能钉，宁可不钉也不弄坏原文：
+//   钉在表格行 -> 多出一个单元格，表格直接坏掉
+//   钉在代码围栏 / 落在未闭合的代码块里 -> 围栏作废，后面的原文全变代码
+//   钉在空行上 -> Obsidian 不认（`^id` 得在段落开头或整行）
+// 一行适不适合钉锚点（块锚点与行锚点同一套 markdown 顾忌）。
+// 返回原因串（拼在主语后面用）或 null。
+function lineAnchorBlocker(lines, idx) {
+  const ln = String(lines[idx]);
+  if (ln.trim() === "") return "是空行";
+  if (/^\s*(```|~~~)/.test(ln)) return "是代码块围栏";
+  if (/^\s*\|/.test(ln)) return "是表格行";
+  if (/^#{1,6}\s/.test(ln)) return "是标题";
+  if (/^\s*<!--/.test(ln)) return "是注释";
+  if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(ln)) return "是分隔线";
+  // 落在未闭合的代码块里 -> 锚点会被当成代码内容，Obsidian 不注册
   let fences = 0;
-  for (const ln of lines) if (/^\s*(```|~~~)/.test(ln)) fences += 1;
-  if (fences % 2 === 1) return "正文末尾在未闭合的代码块里";
-  let last = "";
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].trim() !== "") {
-      last = lines[i];
-      break;
-    }
-  }
-  if (/^\s*(```|~~~)/.test(last)) return "正文最后一行是代码块围栏";
-  if (/^\s*\|/.test(last)) return "正文最后一行是表格行";
-  if (/^#{1,6}\s/.test(last)) return "正文最后一行是标题";
-  if (/^\s*<!--/.test(last)) return "正文最后一行是注释";
-  if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(last)) return "正文最后一行是分隔线";
+  for (let i = 0; i <= idx; i++) if (/^\s*(```|~~~)/.test(lines[i])) fences += 1;
+  if (fences % 2 === 1) return "在未闭合的代码块里";
   return null;
+}
+
+// 块锚点该钉在正文的哪一行（C10 修订，2026-09-23）。
+//
+// **新口径：第一行非空行。** Obsidian 给的块范围只有**那一行**，但渲染层（hover 预览 / `![[…]]` 嵌入）
+// 会把「带子项的列表项」连同它的子项一起渲染 —— 所以钉在首行（捕获往往整条挂在一个顶层 `- ` 项下）
+// 预览就是**整条**；钉在末行只剩最深的那条叶子。实测见 decision-log D35 追加。
+// 首行钉不住（标题 / 表格 / 围栏 / 注释 / 空行……）时**退回末行**（旧口径，`--verify-ids` 两种都认）。
+// 两处都不行就不钉，把原因报出来（`--add-anchors` 跳过、捕获只报一句，正文照写）。
+// 返回 { at: 正文行下标, why: null } 或 { at: -1, why: 原因串 }。
+function anchorPlacement(body) {
+  const raw = String(body);
+  if (raw.trim() === "") return { at: -1, why: "块内没有正文" };
+  const lines = raw.split("\n");
+  let first = 0;
+  while (first < lines.length && lines[first].trim() === "") first++;
+  let last = lines.length - 1;
+  while (last >= 0 && lines[last].trim() === "") last--;
+  const headWhy = lineAnchorBlocker(lines, first);
+  if (headWhy === null) return { at: first, why: null };
+  // 末尾有空行时不能按「拼在内容末尾」那种方式钉（会落到新起的一行上），退回分支里照旧挡掉。
+  const tailWhy = /\n[ \t]*$/.test(raw)
+    ? "正文末尾有空行：锚点会落到新起的一行上，Obsidian 认不出来"
+    : lineAnchorBlocker(lines, last);
+  if (tailWhy === null) return { at: last, why: null };
+  return { at: -1, why: "正文第一行" + headWhy + "；退回末行也不行（最后一行" + tailWhy + "）" };
 }
 
 // ---------------------------------------------------------------------------
@@ -2622,6 +2678,14 @@ function cmdAddAnchors(vault, args) {
     : listed.files;
   if (files.length === 0) fail("在日记目录里找不到 " + want + "（本模式只扫 " + folder + "）");
 
+  // 乙案（D35）：点了名（--id / --line）就只碰那一块的那几行 —— 不扫描、不批量，
+  // 因为「哪一行值得指」是语义决定，脚本猜不出来。
+  if (args.move) {
+    if (typeof args.id !== "string") fail("--move 要配 --id=<块 id>（只搬这一块的块锚点）");
+    return moveBlockAnchor(vault, args, listed);
+  }
+  if (args.id !== undefined || args.line !== undefined) return addLineAnchors(vault, args, listed);
+
   const rows = [];
   const plans = [];
   for (const f of files) {
@@ -2645,29 +2709,29 @@ function cmdAddAnchors(vault, args) {
         continue;
       }
       const body = lines.slice(i + 2, j - 1).join("\n");
-      if (/ \^[A-Za-z0-9._-]+$/.test(body)) {
-        // 已经有锚点的块一个字节不动；值对不对是 --verify-ids 的事。
+      // 已经有**块锚点**的块一个字节不动；值对不对是 --verify-ids 的事。
+      // （只挂了行锚点的块不在此列 —— 它的块锚点还没落，本通道照补。）
+      if (anchorsInBody(body).some((a) => a.lineNo === null)) {
         rows.push(Object.assign({}, at, { action: "keep", reason: "已有锚点" }));
         continue;
       }
-      const got = crypto.createHash("sha1").update(stripTailAnchor(body), "utf8").digest("hex").slice(0, 4);
+      const got = crypto.createHash("sha1").update(stripAnchors(body), "utf8").digest("hex").slice(0, 4);
       if (got !== m[2]) {
         rows.push(
           Object.assign({}, at, {
             action: "skip",
-            reason: "正文 hash 与块 id 不一致（先跑 --verify-ids --write）",
+            reason: "锚点与块 id 或行号对不上（先跑 --verify-ids --write）",
           }),
         );
         continue;
       }
-      const why = tailAnchorBlocker(body);
-      if (why) {
-        rows.push(Object.assign({}, at, { action: "skip", reason: why }));
+      const plan = anchorPlacement(body);
+      if (plan.at < 0) {
+        rows.push(Object.assign({}, at, { action: "skip", reason: plan.why }));
         continue;
       }
-      // 锚点钉在**最后一行非空行**的末尾。上面已挡掉末尾有空行的情况，这一步只是防御。
-      let k = j - 2;
-      while (k > i + 1 && lines[k].trim() === "") k--;
+      // 锚点钉在首行（印不下去时是末行）的末尾，位置由 anchorPlacement 算好。
+      const k = i + 2 + plan.at;
       adds.push({ id: id, at: k, before: lines[k], after: lines[k] + " ^" + id });
     }
     if (adds.length === 0) continue;
@@ -2738,6 +2802,299 @@ function cmdAddAnchors(vault, args) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 补行锚点（D35 / 乙案）：给**点名的那一行**补一个 ` ^<块 id>-<行号>`
+//
+// 块锚点（C10）只能代表**整条思考**；待办的 `↩` 要跳到**那句话本身**时用它。
+// 仍然是**纯追加**（正文一个字节不动），所以不碰 R3；也**只在点名时**补 ——
+// 全篇每行都钉一个，源码视图会糊成一片，而且哪一行值得指是语义判断。
+//
+//   先看一眼有哪几行：  --add-anchors --id=<块 id> [--path=…]
+//   再选行补锚点：      --add-anchors --id=<块 id> --line=2[,5] [--path=…] [--write]
+//   把块锚点搬到首行：  --add-anchors --id=<块 id> --move [--path=…] [--write]
+//
+// --line 数是**块内正文的行号**（1 基，同块 id 里那一截），不是文件行号。
+// 落盘后会把现成的链接片段（[[笔记#^<块 id>-<行号>|↩]]）打出来，直接拿去写待办。
+// ---------------------------------------------------------------------------
+function addLineAnchors(vault, args, listed) {
+  const blockId = typeof args.id === "string" ? args.id : "";
+  if (!/^\d{8}-\d{4}-[0-9a-f]{4}$/.test(blockId)) {
+    fail("补行锚点要给出块 id：--id=<块 id>，形如 20260916-1549-0882\n  想给所有缺锚点的旧块补块锚点：不加 --id/--line 重跑。");
+  }
+
+  const want = typeof args.path === "string" ? args.path : null;
+  const target = want || dailyPath(vault);
+  const files = want
+    ? listed.files.filter((f) => f.path === target || f.path.endsWith("/" + target) || path.basename(f.path) === path.basename(target))
+    : listed.files;
+  if (want && files.length === 0) fail("在日记目录里找不到 " + target + "（本模式只扫日记目录；用 --path 点名）");
+  if (want && files.length > 1) fail("--path 匹配到多篇笔记：" + files.map((f) => f.path).join("、"));
+
+  // 不给 --path 就在日记目录里找**哪一篇里有这个块**（块 id 全库唯一，所以只该有一篇）——
+  // 默认只盯「今天」的话，补旧块的行锚点会把 --path 记错成必填。
+  const has = (f) => f.content.split("\n").some((l) => { const m = l.match(ID_BEGIN_RE); return m !== null && m[1] === blockId; });
+  const hits = files.filter(has);
+  if (hits.length === 0) fail("在 " + (want ? files.map((x) => x.path).join("、") : "日记目录") + " 里找不到块 " + blockId);
+  if (hits.length > 1) fail("块 " + blockId + " 在多篇笔记里出现：" + hits.map((f) => f.path).join("、") + "\n  用 --path 点名。");
+
+  const f = hits[0];
+  const lines = f.content.split("\n");
+  let i = -1;
+  for (let k = 0; k < lines.length; k++) {
+    const m = lines[k].match(ID_BEGIN_RE);
+    if (m && m[1] === blockId) {
+      i = k;
+      break;
+    }
+  }
+  if (i < 0) fail("在 " + f.path + " 里找不到块 " + blockId);
+  const endLine = "<!-- jc:end id=" + blockId + " -->";
+  let j = -1;
+  for (let k = i + 1; k < lines.length; k++) {
+    if (lines[k] === endLine) {
+      j = k;
+      break;
+    }
+  }
+  if (j < 0) fail("块 " + blockId + " 的 end 标记缺失（先跑 --verify-ids）");
+
+  const bodyLines = lines.slice(i + 2, j - 1);
+  const got = crypto.createHash("sha1").update(stripAnchors(bodyLines.join("\n")), "utf8").digest("hex").slice(0, 4);
+  if (got !== blockId.slice(-4)) {
+    fail("块 " + blockId + " 的正文 hash 与 id 对不上（实算 " + got + "）\n  先跑 --verify-ids --write 把 id 重算回一致，再来补行锚点。");
+  }
+  const anchors = anchorsInBody(bodyLines.join("\n"));
+  const hasBare = anchors.some((a) => a.lineNo === null);
+  // 块锚点该在哪一行（新口径首行，钉不住才退末行）：这一行还没块锚点时，点它就直接钉**裸块 id**，
+  // 一举两得 —— 整条思考有了锚点，这一句也指得到（同一个锚点，两个链接都能用）。
+  const bareAt = anchorPlacement(bodyLines.join("\n")).at;
+  const noteName = f.path.split("/").pop().replace(/\.md$/, "");
+  const linkOf = (tok) => "[[" + noteName + "#^" + tok + "|↩]]";
+
+  // 没给 --line：先把块里的行连行号、连现成链接一起列出来（不写盘）。
+  if (args.line === undefined) {
+    const out = [];
+    for (let k = 0; k < bodyLines.length; k++) {
+      const a = anchors.find((x) => x.at === k);
+      const why = lineAnchorBlocker(bodyLines, k);
+      out.push({
+        line: k + 1,
+        text: bodyLines[k],
+        anchor: a ? a.token.slice(2) : null,
+        link: a ? linkOf(a.token.slice(2)) : null,
+        // 能不能钉 + 钉下去叫什么，先算出来：省得选了一行才发现钉不了。
+        pinnable: why === null,
+        wouldBe: why !== null ? null : k === bareAt && !hasBare ? blockId : blockId + "-" + (k + 1),
+        reason: why,
+      });
+    }
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ok: true, status: "listed", path: f.path, id: blockId, blockAnchor: hasBare, lines: out }, null, 2) + "\n");
+    } else {
+      process.stdout.write("块 " + blockId + " 在 " + f.path + "（共 " + bodyLines.length + " 行正文，块锚点「" + (hasBare ? "有" : "没") + "」）\n\n");
+      for (const r of out) {
+        process.stdout.write("  行 " + r.line + "  「" + r.text + "」\n");
+        process.stdout.write("        " + (r.anchor ? "已有锚点 " + r.anchor + "  " + r.link : r.pinnable ? "可钉 " + r.wouldBe + "  " + linkOf(r.wouldBe) : "钉不了：" + r.reason) + "\n");
+      }
+      process.stdout.write("\n选好行号后：  --add-anchors --id=" + blockId + " --line=<行号>  （先干跑，确认后加 --write）\n");
+    }
+    return;
+  }
+
+  const wants = String(args.line).split(/[,\s]+/).filter((s) => s !== "").map(Number);
+  if (wants.length === 0 || wants.some((n) => !Number.isInteger(n) || n < 1)) {
+    fail("--line 只能是正整数（可逗号分隔）：" + args.line);
+  }
+
+  const rows = [];
+  const adds = [];
+  for (const n of wants) {
+    const bAt = n - 1;
+    const at = i + 2 + bAt;
+    if (bAt >= bodyLines.length) {
+      rows.push({ line: n, action: "skip", reason: "块内只有 " + bodyLines.length + " 行正文" });
+      continue;
+    }
+    const existing = anchors.find((a) => a.at === bAt);
+    const why = lineAnchorBlocker(bodyLines, bAt);
+    if (why) {
+      rows.push({ line: n, action: "skip", reason: why, text: bodyLines[bAt] });
+      continue;
+    }
+    // 裸块 id 只给「块锚点该在的那一行」（新口径首行，钉不住才退末行）：块还没钉块锚点时，
+    // 这一行直接钉**裸块 id**，一举两得 —— 整条思考的锚点有了，这一句也指得到。
+    const tok = bAt === bareAt && !hasBare ? blockId : blockId + "-" + n;
+    if (existing) {
+      const same = existing.token.slice(2) === tok;
+      rows.push({ line: n, action: same ? "keep" : "skip", reason: same ? "已经有这个锚点" : "这一行已经有了 " + existing.token + "（一行只钉一个；要换得先把旧的摘掉）", anchor: existing.token.slice(2), link: linkOf(existing.token.slice(2)), text: bodyLines[bAt] });
+      continue;
+    }
+    adds.push({ at: at, line: n, before: lines[at], after: lines[at] + " ^" + tok, anchor: tok });
+    rows.push({ line: n, action: "add", text: bodyLines[bAt], before: lines[at], after: lines[at] + " ^" + tok, anchor: tok, link: linkOf(tok) });
+  }
+
+  const added = rows.filter((r) => r.action === "add");
+  const kept = rows.filter((r) => r.action === "keep");
+  const skipped = rows.filter((r) => r.action === "skip");
+
+  if (added.length === 0) {
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ok: true, status: "nothing-to-do", path: f.path, id: blockId, kept: kept, skipped: skipped, rows: rows }, null, 2) + "\n");
+    } else {
+      process.stdout.write("补行锚点：没有要补的（已有 " + kept.length + " 个，跳过 " + skipped.length + " 个）\n");
+      for (const r of skipped) process.stdout.write("  行 " + r.line + "  " + r.reason + "\n");
+      for (const r of kept) process.stdout.write("  行 " + r.line + "  现成的链接：" + r.link + "\n");
+    }
+    return;
+  }
+
+  const afterLines = lines.slice();
+  for (const a of adds) afterLines[a.at] = a.after;
+  const after = afterLines.join("\n");
+  // 除了这几个追加串，文件其他部分必须逐字节未动：全部推回去后应正好等于原文。
+  let restored = after;
+  for (const a of adds) restored = replaceAllText(restored, a.after, a.before);
+  const untouched = restored === f.content;
+
+  if (!args.write) {
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ok: true, dryRun: true, path: f.path, id: blockId, adds: adds, kept: kept, skipped: skipped, rows: rows }, null, 2) + "\n");
+    } else {
+      process.stdout.write("补行锚点（未落盘）\n\n  " + f.path + "  块 " + blockId + "\n\n");
+      for (const r of rows) {
+        if (r.action === "add") {
+          process.stdout.write("    行 " + r.line + "  「" + r.text + "」\n      → 「" + r.after + "」\n      锚点 " + r.anchor + "\n      链接 " + r.link + "\n");
+        } else {
+          process.stdout.write("    行 " + r.line + "  跳过：" + r.reason + (r.link ? "  现成的链接 " + r.link : "") + "\n");
+        }
+      }
+      process.stdout.write("\n只追加锚点，正文与标记一个字节不动。确认后加 --write 重跑。\n");
+    }
+    return;
+  }
+
+  if (!untouched) fail("除了追加串还动到了别的字节：" + f.path + "\n  脚本 bug，已中止未落盘。");
+
+  const bdir = path.join(listed.root, ".daily-journal", "backup");
+  fs.mkdirSync(bdir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backup = path.join(bdir, path.basename(f.path) + "." + stamp + ".bak");
+  fs.writeFileSync(backup, f.content);
+  writeNoteInObsidian(vault, { rel: f.path, expectBefore: f.content, after: after, untouched: untouched });
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify({ ok: true, status: "written", path: f.path, id: blockId, adds: adds, backup: backup, rows: rows }, null, 2) + "\n");
+  } else {
+    process.stdout.write("补行锚点完成：" + f.path + "  补了 " + added.length + " 个\n   备份: " + backup + "\n\n");
+    for (const r of added) process.stdout.write("  行 " + r.line + "  锚点 " + r.anchor + "\n    待办里写：" + r.link + "\n");
+    process.stdout.write("\n正文一个字节未动，只追加了锚点。\n");
+  }
+}
+
+function moveBlockAnchor(vault, args, listed) {
+  const blockId = String(args.id);
+
+  const want = typeof args.path === "string" ? args.path : null;
+  const target = want || dailyPath(vault);
+  const files = want
+    ? listed.files.filter((f) => f.path === target || f.path.endsWith("/" + target) || path.basename(f.path) === path.basename(target))
+    : listed.files;
+  if (want && files.length === 0) fail("在日记目录里找不到 " + target + "（本模式只扫日记目录；用 --path 点名）");
+  if (want && files.length > 1) fail("--path 匹配到多篇笔记：" + files.map((f) => f.path).join("、"));
+
+  const has = (f) => f.content.split("\n").some((l) => { const m = l.match(ID_BEGIN_RE); return m !== null && m[1] === blockId; });
+  const hits = files.filter(has);
+  if (hits.length === 0) fail("在 " + (want ? files.map((x) => x.path).join("、") : "日记目录") + " 里找不到块 " + blockId);
+  if (hits.length > 1) fail("块 " + blockId + " 在多篇笔记里出现：" + hits.map((f) => f.path).join("、") + "\n  用 --path 点名。");
+
+  const f = hits[0];
+  const lines = f.content.split("\n");
+  let i = -1;
+  for (let k = 0; k < lines.length; k++) {
+    const m = lines[k].match(ID_BEGIN_RE);
+    if (m && m[1] === blockId) {
+      i = k;
+      break;
+    }
+  }
+  if (i < 0) fail("在 " + f.path + " 里找不到块 " + blockId);
+  const endLine = "<!-- jc:end id=" + blockId + " -->";
+  let j = -1;
+  for (let k = i + 1; k < lines.length; k++) {
+    if (lines[k] === endLine) {
+      j = k;
+      break;
+    }
+  }
+  if (j < 0) fail("块 " + blockId + " 的 end 标记缺失（先跑 --verify-ids）");
+
+  const bodyLines = lines.slice(i + 2, j - 1);
+  const body = bodyLines.join("\n");
+  const got = crypto.createHash("sha1").update(stripAnchors(body), "utf8").digest("hex").slice(0, 4);
+  if (got !== blockId.slice(-4)) {
+    fail("块 " + blockId + " 的正文 hash 与 id 对不上（实算 " + got + "）\n  先跑 --verify-ids --write 把 id 重算回一致，再来搬锚点。");
+  }
+
+  const anchors = anchorsInBody(body);
+  const bare = anchors.filter((a) => a.lineNo === null);
+  if (bare.length === 0) {
+    fail("块 " + blockId + " 没有块锚点（只有行锚点或无锚点）\n  不给 --move 直接跑 --add-anchors --id=" + blockId + " 才是补。");
+  }
+  if (bare.length > 1) fail("块 " + blockId + " 里有多个块锚点（" + bare.map((a) => "第 " + (a.at + 1) + " 行").join("、") + "）\n  先跑 --verify-ids 看清楚。");
+
+  const plan = anchorPlacement(body);
+  if (plan.at < 0) fail("块 " + blockId + " 的块锚点搬不了：" + plan.why);
+  const from = bare[0].at;
+  const to = plan.at;
+
+  if (from === to) {
+    if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "nothing-to-do", path: f.path, id: blockId, line: to + 1 }, null, 2) + "\n");
+    else process.stdout.write("块锚点已经在第 " + (to + 1) + " 行（正文「" + bodyLines[to] + "」末尾），不用搬。\n");
+    return;
+  }
+
+  const before = lines[i + 2 + from];
+  const afterFrom = stripAnchors(before);
+  const put = lines[i + 2 + to];
+  const putAfter = put + " ^" + blockId;
+  const afterLines = lines.slice();
+  afterLines[i + 2 + to] = putAfter;
+  afterLines[i + 2 + from] = afterFrom;
+  const after = afterLines.join("\n");
+  // 搬锚点只该动这两行，且推回去应逐字节等于原文：
+  // 「先长后短」同样适用于这里 —— 裸锚点是短的那个，但两行的改动是分行的，各推各的。
+  let restored = after;
+  restored = replaceAllText(restored, putAfter, put);
+  restored = replaceAllText(restored, afterFrom, before);
+  const untouched = restored === f.content;
+
+  if (!args.write) {
+    if (args.json) process.stdout.write(JSON.stringify({ ok: true, dryRun: true, path: f.path, id: blockId, from: from + 1, to: to + 1, moves: [{ from: before, to: afterFrom }, { from: put, to: putAfter }], untouched: untouched }, null, 2) + "\n");
+    else {
+      process.stdout.write("搬块锚点（未落盘）\n\n  " + f.path + "  块 " + blockId + "\n");
+      process.stdout.write("    摘掉  行 " + (from + 1) + "  「" + before + "」\n         → 「" + afterFrom + "」\n");
+      process.stdout.write("    钉上  行 " + (to + 1) + "  「" + put + "」\n         → 「" + putAfter + "」\n");
+      process.stdout.write("\n搬完 hover/预览就是整条（块锚点在首行时，Obsidian 会把子项一起渲染）。\n");
+      process.stdout.write("id 不变，所以索引行与待办里的链接一个都不用改。确认后加 --write 重跑。\n");
+    }
+    return;
+  }
+
+  if (!untouched) fail("搬锚点动到了别的字节：" + f.path + "\n  脚本 bug，已中止未落盘。");
+
+  const bdir = path.join(listed.root, ".daily-journal", "backup");
+  fs.mkdirSync(bdir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backup = path.join(bdir, path.basename(f.path) + "." + stamp + ".bak");
+  fs.writeFileSync(backup, f.content);
+  writeNoteInObsidian(vault, { rel: f.path, expectBefore: f.content, after: after, untouched: untouched });
+
+  if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "written", path: f.path, id: blockId, from: from + 1, to: to + 1, backup: backup }, null, 2) + "\n");
+  else {
+    process.stdout.write("搬块锚点完成：" + f.path + "\n   行 " + (from + 1) + " → 行 " + (to + 1) + "  块 " + blockId + "\n   备份: " + backup + "\n\n正文一个字节未动，id 不变，既有链接照旧。\n");
+  }
+}
+
 function cmdVerifyIds(vault, args) {
   const dp = dailyPath(vault);
   const slash = dp.lastIndexOf("/");
@@ -2769,16 +3126,50 @@ function cmdVerifyIds(vault, args) {
         continue;
       }
       const body = lines.slice(i + 2, j - 1).join("\n");
-      // 锚点不算正文：先剥掉再算 hash，不然每个带锚点的新块都会被判成「正文被改过」。
-      const anchor = (body.match(/ \^([A-Za-z0-9._-]+)$/) || [])[1] || null;
-      const got = crypto.createHash("sha1").update(stripTailAnchor(body), "utf8").digest("hex").slice(0, 4);
+      // 锚点不算正文：逐行剥掉再算 hash（块内可能挂着若干**行锚点**），
+      // 不然每个带锚点的新块都会被判成「正文被改过」。
+      const anchors = anchorsInBody(body);
+      const bare = anchors.filter((a) => a.lineNo === null);
+      const got = crypto.createHash("sha1").update(stripAnchors(body), "utf8").digest("hex").slice(0, 4);
       const hashOk = got === m[2];
-      // 锚点是块 id 的副本，两者不一致一样算对不上 —— 只差锚点也报出来，别让它悄悄烂掉。
-      const anchorOk = anchor === null || anchor === m[1];
+      // 块内每个锚点都得是**本块 id 的副本**：行锚点还多一位行号，那位必须等于它实际所在的行号。
+      // 行号对不上 = 中间被插过/删过行，链接可能已经指到别的一句话上了 —— 报出来，
+      // 重编号由 --write 做，但要连「引用它的链接得重新核对」一并说清楚（不静默换指向）。
+      const bodyLines = body.split("\n");
+      // 块锚点只认两个位置：**首行**（新口径，2026-09-23 起）与**末行**（旧块，不回填）。
+      // 中间 = 真错了（大概率是拼接时手滑），报出来。
+      let firstNonBlank = -1;
+      for (let k = 0; k < bodyLines.length; k++) {
+        if (bodyLines[k].trim() !== "") {
+          firstNonBlank = k;
+          break;
+        }
+      }
+      let lastNonBlank = -1;
+      for (let k = bodyLines.length - 1; k >= 0; k--) {
+        if (bodyLines[k].trim() !== "") {
+          lastNonBlank = k;
+          break;
+        }
+      }
+      const badAnchors = [];
+      for (const a of anchors) {
+        if (a.id !== m[1]) badAnchors.push({ at: a.at + 1, token: a.token, why: "锚点前缀不是本块 id" });
+        else if (a.lineNo !== null && a.lineNo !== a.at + 1) badAnchors.push({ at: a.at + 1, token: a.token, why: "行锚点写的是第 " + a.lineNo + " 行，实际在第 " + (a.at + 1) + " 行" });
+        else if (a.lineNo === null && a.at !== firstNonBlank && a.at !== lastNonBlank) badAnchors.push({ at: a.at + 1, token: a.token, why: "块锚点钉在正文中间（约定钉第一行；旧块在最后一行也认）" });
+      }
+      const anchorOk = badAnchors.length === 0;
       rows.push({
-        path: f.path, line: i + 1, id: m[1], stored: m[2], computed: got, anchor: anchor,
+        path: f.path, line: i + 1, id: m[1], stored: m[2], computed: got,
+        anchor: bare.length > 0 ? bare[0].token : null,
+        anchors: anchors.map((a) => a.token),
         ok: hashOk && anchorOk,
-        reason: !hashOk ? "正文 hash 与块 id 不一致" : anchorOk ? undefined : "尾部锚点与块 id 不一致",
+        reason: !hashOk
+          ? "正文 hash 与块 id 不一致"
+          : anchorOk
+            ? undefined
+            : "锚点与正文对不上（" + badAnchors.map((b) => "第 " + b.at + " 行 " + b.why).join("；") + "）",
+        drifted: badAnchors.filter((b) => /实际在第/.test(b.why)).map((b) => ({ at: b.at, token: b.token })),
       });
       if (!hashOk || !anchorOk) {
         stale.push({
@@ -2786,10 +3177,9 @@ function cmdVerifyIds(vault, args) {
           newId: m[1].slice(0, m[1].length - 5) + "-" + got,
           from: i,
           to: j,
-          anchorAt: anchor === null ? -1 : j - 2,
-          // 锚点的**原值**得记下来：回推证明要拿它把锚点还原，
-          // 只记 anchorAt 的话「锚点值不对、hash 对」这种情况回推不回去，会被误判成块外被牵连。
-          anchorWas: anchor,
+          // 每个锚点的**原样串**得记下来：回推证明要拿它把锚点还原，
+          // 只说「换前缀」的话「锚点值不对、hash 对」这种情况回推不回去，会被误判成块外被牵连。
+          anchors: anchors,
         });
       }
     }
@@ -2798,7 +3188,11 @@ function cmdVerifyIds(vault, args) {
       lines[s.from] = "<!-- jc:begin id=" + s.newId + " -->";
       lines[s.to] = "<!-- jc:end id=" + s.newId + " -->";
       // 锚点跟着 id 一起换：只改标记会留下一个指向不存在块的锚点。
-      if (s.anchorAt >= 0) lines[s.anchorAt] = lines[s.anchorAt].replace(/ \^[A-Za-z0-9._-]+$/, " ^" + s.newId);
+      // 行锚点按**它实际所在的行号**重钉（即行号漂了才重钉，并在报告里点名）。
+      for (const a of s.anchors) {
+        const at = s.from + 2 + a.at;
+        lines[at] = lines[at].replace(ANCHOR_RE, " ^" + s.newId + (a.lineNo === null ? "" : "-" + (a.at + 1)));
+      }
     }
     let after = lines.join("\n");
     after = remapIndexRowIds(after, stale.map((s) => ({ from: s.id, to: s.newId })));
@@ -2807,7 +3201,13 @@ function cmdVerifyIds(vault, args) {
     for (const s of stale) {
       restored = replaceAllText(restored, "<!-- jc:begin id=" + s.newId + " -->", "<!-- jc:begin id=" + s.id + " -->");
       restored = replaceAllText(restored, "<!-- jc:end id=" + s.newId + " -->", "<!-- jc:end id=" + s.id + " -->");
-      if (s.anchorAt >= 0) restored = replaceAllText(restored, " ^" + s.newId, " ^" + s.anchorWas);
+      // 锚点串还原：**先长后短** —— ` ^<新 id>-3` 以 ` ^<新 id>` 为前缀，
+      // 先换短的会把长的那一截也换掉，回推就越推越乱。
+      const toks = s.anchors.slice().sort((x, y) => y.token.length - x.token.length);
+      for (const a of toks) {
+        const nowTok = " ^" + s.newId + (a.lineNo === null ? "" : "-" + (a.at + 1));
+        restored = replaceAllText(restored, nowTok, a.token);
+      }
     }
     restored = remapIndexRowIds(restored, stale.map((s) => ({ from: s.newId, to: s.id })));
     plans.push({ rel: f.path, expectBefore: f.content, after: after, stale: stale, untouched: restored === f.content });
@@ -2827,11 +3227,13 @@ function cmdVerifyIds(vault, args) {
     else {
       process.stdout.write("id 自检：" + rows.length + " 个块，其中 " + bad.length + " 个与正文对不上\n\n");
       for (const r of bad) {
+        const drifted = (r.drifted || []).map((d) => "第 " + d.at + " 行 " + d.token).join("、");
         process.stdout.write(
-          "  " + r.path + ":" + r.line + "  " + r.id + "\n    id 里的 hash " + (r.stored || "—") + "，正文实算 " + (r.computed || "—") + (r.reason ? "  " + r.reason : "") + "\n",
+          "  " + r.path + ":" + r.line + "  " + r.id + "\n    id 里的 hash " + (r.stored || "—") + "，正文实算 " + (r.computed || "—") + (r.reason ? "  " + r.reason : "") +
+            (drifted ? "\n    行锚点漂了：" + drifted + "（--write 会按实际行号重编号；引用它的链接会跳不到，得人工核对）" : "") + "\n",
         );
       }
-      process.stdout.write("\n含义：这些块的正文在写入后被改过，或由旧版脚本写入。\n加 --write 把 id 重算成与正文一致（只改 id 与尾部锚点这两串字符，正文一个字节不动）。\n");
+      process.stdout.write("\n含义：这些块的正文在写入后被改过，或由旧版脚本写入。\n加 --write 把 id 重算成与正文一致（只改 id 与锚点这两串字符，正文一个字节不动）。\n");
     }
     process.exit(1);
   }
@@ -2843,19 +3245,31 @@ function cmdVerifyIds(vault, args) {
   fs.mkdirSync(bdir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const healed = [];
+  const renumbered = [];
   for (const p of plans) {
     const b = path.join(bdir, path.basename(p.rel) + "." + stamp + ".bak");
     fs.writeFileSync(b, p.expectBefore);
     p.backup = b;
     writeNoteInObsidian(vault, p);
-    for (const s of p.stale) healed.push({ path: p.rel, id: s.id, newId: s.newId });
+    for (const s of p.stale) {
+      healed.push({ path: p.rel, id: s.id, newId: s.newId, anchors: s.anchors.map((a) => a.token) });
+      for (const a of s.anchors) {
+        if (a.lineNo === null || a.lineNo === a.at + 1) continue;
+        renumbered.push({ path: p.rel, id: s.id, at: a.at + 1, was: a.token, now: " ^" + s.newId + "-" + (a.at + 1) });
+      }
+    }
   }
 
-  if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "healed", healed: healed, rows: rows }, null, 2) + "\n");
+  if (args.json) process.stdout.write(JSON.stringify({ ok: true, status: "healed", healed: healed, renumbered: renumbered, rows: rows }, null, 2) + "\n");
   else {
     process.stdout.write("id 已重算：" + staleCount + " 个块\n\n");
     for (const h of healed) process.stdout.write("  " + h.path + "  " + h.id + " -> " + h.newId + "\n");
-    process.stdout.write("\n正文一个字节未动，只换了 id 与尾部锚点这两串字符。\n");
+    process.stdout.write("\n正文一个字节未动，只换了 id 与锚点这两串字符。\n");
+    if (renumbered.length > 0) {
+      process.stdout.write("\n！行锚点重编号（行被插过或删过）：引用它的链接现在跳不到了，要人工核对一遍\n");
+      for (const r of renumbered) process.stdout.write("  " + r.path + "  第 " + r.at + " 行  " + r.was + " -> " + r.now + "\n");
+      process.stdout.write("  （待办里的 [[笔记#^旧锚点|↩]] 得改成新锚点；本轮不动待办节，那是另一条通道）\n");
+    }
   }
 }
 
@@ -2911,14 +3325,20 @@ function main() {
         "    --path=<路径|文件名>       只修这一个文件；块内正文请改用 --fix-written",
         "    --write                   落盘（会先备份到 .daily-journal/backup/）",
         "  把历史笔记里裹反引号的「块 id」格改写成块链接（默认 dry-run）:",
-        "    --link-block-ids          只动派生层索引行的 id 格；块缺尾部锚点的先跑 --add-anchors",
+        "    --link-block-ids          只动派生层索引行的 id 格；块缺块锚点的先跑 --add-anchors",
         "  迁移派生层的历史分类（默认 dry-run）:",
         "    --migrate-tags            把索引里裹反引号的分类还原成裸标签",
         "    --map='旧→新'             可逗号分隔多对，用于个别改写（如 life/HomeLab→life）",
         "    --allow-new-tag           迁移结果含词表外新标签时放行（同上，先问用户）",
         "  自检:",
-        "    --verify-ids              校 jc 块的 id 与尾部锚点是否仍与正文自洽；不一致退 1",
-        "    --add-anchors             给旧块补上尾部锚点（纯追加，让 [[笔记#^id]] 跳得回来）",
+        "    --verify-ids              校 jc 块的 id 与锚点（块锚点 / 行锚点）是否仍与正文自洽；不一致退 1",
+        "    --add-anchors             给旧块补上块锚点（纯追加，钉在正文首行；[[笔记#^id]] 才跳得回来）",
+        "    --id=<块 id> --line=N      只给这一块的**第 N 行**再补一个行锚点 ^<块 id>-N",
+        "                              （行号是块内正文的行号，可逗号分隔多个；不给 --line",
+        "                              就先把行号与现成链接列出来。待办的 ↩ 要跳到某一句时用）",
+        "    --id=<块 id> --move        把这一块的块锚点搬到首行（钉不住才退末行）：正文一个字节不动、",
+        "                              id 也不变，所以既有链接照旧，只是 hover/预览从「最后一行」",
+        "                              变成「整条」（Obsidian 连子项一起渲染）。旧块不回填，想搬才搬",
         "    --write                   把对不上的 id 重算回一致（正文不动）",
         "    --fix=safe                写入时自动套用无损修正（行尾空白/重复虚词/大小写）",
         "    --fix=all                 写入时套用全部可机械修正项（含改字，需用户确认）",
@@ -3332,20 +3752,28 @@ function main() {
     todoContent = todoLines.join("\n");
   }
 
-  // 尾部锚点（C10）：钉在正文最后一行的末尾，让 [[笔记#^id]] 跳得回这段思考。
-  // 它是 agent 自己生成的 token、不属于正文，但**位置在正文里**，所以末尾不适合钉时就不钉 ——
+  // 块锚点（C10）：钉在正文某一行（新口径：第一行非空行）的末尾，让 [[笔记#^id]] 跳得回这段思考。
+  // 位置不是随便选的：Obsidian 给的块范围只有那一行，但渲染层会把「带子项的列表项」连子项一起渲染 ——
+  // 钉首行，hover 预览 / `![[…]]` 嵌入给出的是**整条**；钉末行只剩最深那条叶子（实测见 decision-log D35）。
+  // 它是 agent 自己生成的 token、不属于正文；位置由 anchorPlacement 算，真钉不了就不钉 ——
   // 只报出来，捕获本身照走（原文优先，绝不为了埋个锚点去弄坏 markdown）。
   let anchor = "";
+  let anchorLine = -1;
   let anchorSkipped = null;
   if (!isTodo) {
-    anchorSkipped = tailAnchorBlocker(finalContent);
-    if (anchorSkipped === null) anchor = " ^" + id;
+    const plan = anchorPlacement(finalContent);
+    if (plan.at < 0) anchorSkipped = plan.why;
+    else {
+      anchor = " ^" + id;
+      anchorLine = plan.at;
+    }
   }
 
   const payload = {
     path: rel,
     content: isTodo ? todoContent : finalContent,
     anchor: anchor,
+    anchorLine: anchorLine,
     kind: isTodo ? "todo" : "thought",
     noteDate: noteDate,
     createdDateSource: createdDateSource,
@@ -3439,7 +3867,7 @@ function main() {
     } else {
       process.stdout.write("状态: " + res.status + "  id: " + res.id + "  分类: " + res.category + "\n");
       if (res.anchorSkipped) {
-        process.stdout.write("注意: 没钉尾部锚点 —— " + res.anchorSkipped + "\n  后果：这一段不能被 [[本笔记#^id]] 链到（正文照写了）。\n");
+        process.stdout.write("注意: 没钉锚点 —— " + res.anchorSkipped + "\n  后果：这一段不能被 [[本笔记#^id]] 链到（正文照写了）。\n");
       }
     }
     if (res.fixReport && res.fixReport.changed) {

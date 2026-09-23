@@ -26,11 +26,23 @@ const fixWrittenSrc = cut(/const FIXWRITTEN_PAYLOAD = String\.raw`([\s\S]*?)`;\n
 // 指纹域同理：harness 自己再抄一份就会跟实现漂移，所以直接执行源文件里的那个函数。
 const captureStampSrc = new Function("return " + cut(/(function captureStampSrc\(p\) \{[\s\S]*?\n\})/, "captureStampSrc"))();
 const escapeNonAsciiForCli = new Function("return " + cut(/(function escapeNonAsciiForCli\(code\) \{[\s\S]*?\n\})/, "escapeNonAsciiForCli"))();
+// 锚点是三个通道（捕获比对 / --fix-written / --verify-ids）共用的一层，
+// 所以这三个纯函数直接执行源文件里的那份，不在 harness 里另拄一份。
+const anchorFns = (function () {
+  const src = cut(/(const ANCHOR_RE = [\s\S]*?\nconst retokenAnchors = function[\s\S]*?\n\};)/, "锚点函数（ANCHOR_RE / stripAnchors / anchorsInBody / retokenAnchors）");
+  return new Function("return function () {\n" + src + "\nreturn { stripAnchors: stripAnchors, anchorsInBody: anchorsInBody, retokenAnchors: retokenAnchors, isAnchorId: isAnchorId };\n}")();
+})();
+const lineAnchorBlocker = new Function("return " + cut(/(function lineAnchorBlocker\(lines, idx\) \{[\s\S]*?\n\})/, "lineAnchorBlocker"))();
+const anchorPlacement = new Function(
+  "lineAnchorBlocker",
+  "return " + cut(/(function anchorPlacement\(body\) \{[\s\S]*?\n\})/, "anchorPlacement"),
+)(lineAnchorBlocker);
 
 const SECTIONS = { thinking: "今日的思考", todo: "今日待办", derived: "今日分类与关联", related: "关联笔记" };
 const NL = "\n";
 const sha1 = (s) => crypto.createHash("sha1").update(s, "utf8").digest("hex").slice(0, 4);
-const stripAnchor = (s) => s.replace(/ \^[A-Za-z0-9._-]+$/, "");
+// 剥锚点：逐行剥（块锚点新口径钉首行，整串 regex 只剥得掉末尾那个）。
+const stripAnchor = (s) => s.split(NL).map((l) => l.replace(/ \^[A-Za-z0-9._-]+$/, "")).join(NL);
 const sumOf = (s) => {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
@@ -93,6 +105,8 @@ function mkPayload(content, extra = {}) {
       links: "",
       write: false,
       anchor: " ^" + id,
+      // 锚点钉在哪一行由 Node 侧算好（capture 通道用同一个 anchorPlacement）后传给 payload。
+      anchorLine: anchorPlacement(content).at,
       sections: SECTIONS,
     },
     extra,
@@ -106,7 +120,7 @@ const ok = (name, cond, extra) => {
 };
 
 // ---------------------------------------------------------------- 1 捕获
-console.log("\n[1] 捕获：正文末尾钉锚点");
+console.log("\n[1] 捕获：正文首行钉锚点");
 const TEXT = "今天把日记脚本的块锚点补上了。\n\n结论是锚点只能挤在正文里。";
 {
   const s = store(SKELETON);
@@ -114,8 +128,8 @@ const TEXT = "今天把日记脚本的块锚点补上了。\n\n结论是锚点�
   const r = await run(P, s);
   ok("六项校验全绿", r.verify && r.verify.allOk === true, r.verify);
   ok("正文一字未动（bodyExact）", r.verify.bodyExact === true);
-  ok("锚点是纯追加", r.after.includes(TEXT + " ^" + P.id), r.after.split(NL).filter((l) => l.includes("^")).join("|"));
-  ok("锚点落在正文最后一行（不另起行）", r.after.split(NL).some((l) => l === "结论是锚点只能挤在正文里。 ^" + P.id));
+  ok("锚点是纯追加", r.after.includes("今天把日记脚本的块锚点补上了。 ^" + P.id), r.after.split(NL).filter((l) => l.includes("^")).join("|"));
+  ok("锚点落在正文第一行（不另起行）", r.after.split(NL).some((l) => l === "今天把日记脚本的块锚点补上了。 ^" + P.id));
   ok("锚点 = 块 id", r.id === P.id);
   ok("dry-run 没写盘", s.writes === 0);
 
@@ -125,7 +139,7 @@ const TEXT = "今天把日记脚本的块锚点补上了。\n\n结论是锚点�
   const j = lines.findIndex((l, k) => k > i && l === "<!-- jc:end id=" + P.id + " -->");
   const body = lines.slice(i + 2, j - 1).join(NL);
   ok("剥锚点后 sha1(正文) == id 里的 hash", sha1(stripAnchor(body)) === P.id.slice(-4), { got: sha1(stripAnchor(body)), want: P.id.slice(-4) });
-  ok("锚点行 = 最后一行正文", j - 2 === lines.findIndex((l) => l.endsWith(" ^" + P.id)));
+  ok("锚点行 = 第一行正文", i + 2 === lines.findIndex((l) => l.endsWith(" ^" + P.id)));
 }
 
 // ---------------------------------------------------------------- 2 幂等
@@ -280,6 +294,126 @@ console.log("\n[8] 改写通道 payload：len/sum 自查同样 fail-closed");
   // 载荷指纹要在**并发检查之前**拦：先证明收到的字节是对的，再谈文件是不是读到的那个。
   const [r5] = await sleep("02-Done/x.md", before, after, { afterSum: sumOf(after) + 1 }, theirs);
   ok("并发 + 指纹坏 → 报 transport-corrupt（不是 readback-mismatch）", r5.error === "transport-corrupt", r5.error || r5.status);
+}
+
+// ------------------------------------------- 9 行锚点（D35：指到具体哪一句）
+console.log("\n[9] 行锚点：剥 / 认 / 换前缀（三个通道都靠这三件事）");
+{
+  const A = anchorFns();
+  const BID = "20260923-0923-0411";
+  const body = [
+    "常规品预测前天就简单做了代码分析 ^" + BID + "-1",
+    "",
+    "- 结论一：建模要拆开 ^" + BID + "-3",
+    "- 结论二：不会被重构掉",
+    "最后一句 ^" + BID,
+  ].join(NL);
+  const plain = [
+    "常规品预测前天就简单做了代码分析",
+    "",
+    "- 结论一：建模要拆开",
+    "- 结论二：不会被重构掉",
+    "最后一句",
+  ].join(NL);
+
+  ok("剥锚点：块锚点与行锚点一起剥，正文一字不差", A.stripAnchors(body) === plain, {
+    got: JSON.stringify(A.stripAnchors(body)),
+  });
+  // 形状没限死的话，正文里碰巧以 ` ^词` 结尾的句子会被当锚点剥掉 —— 那就成静默改原文了。
+  const prose = "口令是 abc ^word";
+  ok("剥锚点：正文里碰巧的 ` ^词` 不剥", A.stripAnchors(prose) === prose, A.stripAnchors(prose));
+  ok("剥锚点：旧锚点形状（非本约定）也不剥", A.stripAnchors("正文 ^2026-abcd") === "正文 ^2026-abcd");
+
+  const found = A.anchorsInBody(body);
+  ok("认得出全部 4 个锚点及各自行号", JSON.stringify(found.map((a) => [a.at + 1, a.lineNo])) === JSON.stringify([[1, 1], [3, 3], [5, null]]), found.map((a) => [a.at + 1, a.lineNo]));
+  ok("裸块锚点的 lineNo 是 null（不是 0）", found[2].lineNo === null, found[2]);
+
+  const NEW = "20260923-0923-ab12";
+  const re = A.retokenAnchors(body, NEW);
+  ok("换前缀：三个锚点全换，行号位保留", re.includes(" ^" + NEW + "-1") && re.includes(" ^" + NEW + "-3") && re.includes("最后一句 ^" + NEW), re);
+  ok("换前缀：剥掉后仍是同一段正文", A.stripAnchors(re) === plain);
+  ok("换前缀：行数不变（行位置不漂）", re.split(NL).length === body.split(NL).length);
+  ok("换前缀：新 hash 就是对剥掉锚点的正文算的", sha1(A.stripAnchors(re)) === sha1(plain));
+
+  // 钉不钉得上：这几类行钉了会把 markdown 弄坏，必须先拦。
+  const mk = (ls, i) => lineAnchorBlocker(ls, i);
+  ok("拒绝：空行", mk(["正文", ""], 1) !== null);
+  ok("拒绝：表格行", mk(["正文", "| a | b |"], 1) !== null);
+  ok("拒绝：代码围栏", mk(["正文", "```"], 1) !== null);
+  ok("拒绝：未闭合代码块里的行", mk(["```", "代码 ^x"], 1) !== null);
+  ok("拒绝：闭合代码块之后的行可以钉", mk(["```", "代码", "```", "正文"], 3) === null);
+  ok("拒绝：标题", mk(["正文", "## 标题"], 1) !== null);
+  ok("普通行可钉", mk(["正文", "- 子项"], 1) === null);
+  ok("钉位：普通正文钉首行", anchorPlacement("第一句\n\n第二句").at === 0);
+  ok("钉位：列表整条钉首行（整条挂在顶层项下时就该这样）", anchorPlacement("- 父项\n  - 子项一\n  - 子项二").at === 0);
+  ok("钉位：首行是标题就退末行", anchorPlacement("## 标题\n正文").at === 1);
+  ok("钉位：首行是表格行就退末行", anchorPlacement("| a |\n正文").at === 1);
+  ok("钉位：首行是围栏就退末行", anchorPlacement("```\n代码\n```").at === -1, anchorPlacement("```\n代码\n```"));
+  ok("钉位：首末都不行就不钉，并给出原因", anchorPlacement("## 标题\n| a |").at === -1 && /标题/.test(anchorPlacement("## 标题\n| a |").why));
+  ok("钉位：末尾有空行不影响钉子（钉首行）", anchorPlacement("正文\n").at === 0);
+  ok("钉位：全空就不钉", anchorPlacement("   \n").at === -1);
+}
+
+// ------------------------------- 10 补过行锚点的块，再捕一次不能变成 id-collision
+console.log("\n[10] 块里挂着行锚点时：正文比对要先把行锚点剥干净（否则重捕像撞 id）");
+{
+  const id = "20260920-1037-" + sha1(TEXT);
+  const anchoredText = TEXT.split(NL).map((l, k) => (k === 0 ? l + " ^" + id + "-1" : l)).join(NL);
+  const legacy = SKELETON.replace(
+    "## " + SECTIONS.todo,
+    "<!-- jc:begin id=" + id + " -->\n\n" + anchoredText + "\n\n<!-- jc:end id=" + id + " -->\n\n## " + SECTIONS.todo,
+  );
+  const s = store(legacy);
+  const d = await run(mkPayload(TEXT), s);
+  ok("带行锚点的旧块 → 认成 duplicate", d.status === "duplicate" && d.ok === true, d.status || d.error);
+  ok("没有多写一次盘", s.writes === 0, s.writes);
+}
+
+// ------------------------------- 11 块锚点位置（首行；首行钉不住才退末行）
+console.log("\n[11] 块锚点位置：写在 payload 指的那一行，且首行有锚点也算「同一段」");
+{
+  // 首行是标题（钉不住）→ 自动退末行，但正文与校验仍得一模一样。
+  const text = "## 小标题\n正文一句";
+  const s = store(SKELETON);
+  const P = mkPayload(text);
+  ok("退末行：anchorLine 指向最后一行", P.anchorLine === 1, P.anchorLine);
+  const r = await run(P, s);
+  ok("退末行：六项校验全绿", r.verify && r.verify.allOk === true, r.verify);
+  ok("退末行：锚点落在末行末尾", r.after.split(NL).some((l) => l === "正文一句 ^" + P.id));
+  {
+    const ls = r.after.split(NL);
+    const i2 = ls.findIndex((l) => l === "<!-- jc:begin id=" + P.id + " -->");
+    const j2 = ls.findIndex((l, k) => k > i2 && l === "<!-- jc:end id=" + P.id + " -->");
+    ok("退末行：剥掉锚点后 sha1 == id 里的 hash", sha1(stripAnchor(ls.slice(i2 + 2, j2 - 1).join(NL))) === P.id.slice(-4));
+    ok("退末行：正文剥回原文", stripAnchor(ls.slice(i2 + 2, j2 - 1).join(NL)) === text);
+  }
+
+  // 首行钉不住、末行也不行（表格）→ 不钉，只把原因报出来；正文照写、校验照绿。
+  const t2 = "| a | b |";
+  const s2 = store(SKELETON);
+  const P2 = mkPayload(t2, { anchor: "", anchorLine: -1 });
+  const r2 = await run(P2, s2);
+  ok("钉不了：正文照写、校验全绿", r2.verify && r2.verify.allOk === true, r2.verify);
+  {
+    const ls2 = r2.after.split(NL);
+    const i3 = ls2.findIndex((l) => l === "<!-- jc:begin id=" + P2.id + " -->");
+    const j3 = ls2.findIndex((l, k) => k > i3 && l === "<!-- jc:end id=" + P2.id + " -->");
+    // 只看块内：派生层的索引行本来就带 [[#^id\|id]]，跟这里的「钉没钉」不是一回事。
+    ok("钉不了：块内没有锚点", !ls2.slice(i3 + 2, j3 - 1).join(NL).includes("^"));
+  }
+
+  // 首行挂着块锚点的块，再捕一次也要认成 duplicate（剥锚点是逐行的，不是只剥尾巴）。
+  const t3 = "第一句\n第二句";
+  const id3 = "20260920-1037-" + sha1(t3);
+  const anchored = t3.split(NL).map((l, k) => (k === 0 ? l + " ^" + id3 : l)).join(NL);
+  const legacy = SKELETON.replace(
+    "## " + SECTIONS.todo,
+    "<!-- jc:begin id=" + id3 + " -->\n\n" + anchored + "\n\n<!-- jc:end id=" + id3 + " -->\n\n## " + SECTIONS.todo,
+  );
+  const s3 = store(legacy);
+  const d3 = await run(mkPayload(t3), s3);
+  ok("首行锚点的旧块 → duplicate", d3.status === "duplicate" && d3.ok === true, d3.status || d3.error);
+  ok("首行锚点的旧块 → 没有多写一次盘", s3.writes === 0, s3.writes);
 }
 
 console.log("\n" + (failn === 0 ? "全部通过" : "有失败") + "：" + pass + " 通过 / " + failn + " 失败");
