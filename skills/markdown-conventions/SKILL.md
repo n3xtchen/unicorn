@@ -27,7 +27,7 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 1. **表格不要手对齐。** 单元格一律写成 `| a | b |`（单空格），别用空格把竖线怼齐。手对齐的表格在后续编辑单元格时会与表头/分隔行错位，直接触发 MD060。
 2. **标题层级不跳级**，且**结尾不带标点**。实测 `.` `,` `;` `:` `!` `。` `，` `；` `：` `！` 都会报 MD026（半角 `?` 例外，但不建议依赖）。
 3. **同级标题不重名。** MD024 默认跨全文档检查，不同章节下的同名标题也会报。
-4. **围栏必须带语言。** 普通文本用 ` ```text `，图用 ` ```mermaid `，日志用 ` ```log `，bash 用 ` ```bash `。
+4. **围栏必须带语言。** 图（链路、时序、状态、流程）一律用 ` ```mermaid `，`text` 只留给伪代码、字段清单、张量形状这类非图块；日志用 ` ```log `，bash 用 ` ```bash `。画图前先扫一眼同目录既有图用什么，画完的 mermaid 必须真渲染一次（D10）。
 5. **加粗不能当标题。** 单独一行的 `**① chronos**` 触发 MD036，要写成 `#### ① chronos`。
 6. **列表统一用 `-`**，子项缩进 **4 空格**（用户配置非默认值，2 空格会报 MD007）；列表前后各留一个空行（MD032）。
 7. **标题前后（MD022）、围栏前后（MD031）都要留空行。**
@@ -80,14 +80,16 @@ Vault 根：`<vault>` —— **不要写死绝对路径**。向 Obsidian 索取�
 - **字段顺序固定**：描述 → 行内标签 → 优先级 → `➕` → `🛫` → `⏳` → `📅` → `🔁` → `✅`。乱序会让状态分组与日期查询漏行。
 - **一行一个 checkbox**：顶格写 `- [ ]`，子项缩进 4 空格（与本 skill 第 6 条一致），同一个块内不混 Tab。
 - 手写的任务行要自己带 `➕ YYYY-MM-DD`，不写就进不了 `(created …)` 这类查询。
+- **完成即关闭，不删除**（D11）：任务做完，把状态符改成 `- [x]` 并补 `✅ YYYY-MM-DD`，**原描述保留**；不删行，也不换成新写的一行「…（已完成）」。结论接在 `✅` 之后（`—— <结论>`），与库里既有已关闭任务行同形。
 
 自检（markdownlint 不管这块，这一步只能自己看）：
 
 ```bash
-rg -n '^\s*- \[[ x?/-]\]' <file.md>    # 把任务行列出来，逐行确认行尾是 emoji 字段、顺序对得上
+rg -n '^\s*- \[[ x?/-]\]' <file.md>        # 逐行确认行尾是 emoji 字段、字段顺序对得上
+git diff -- <file.md> | rg '^[-+] *- \['   # 本轮动过待办时：应为勾选与补 ✅，不应出现整行删除
 ```
 
-契约正文（状态词表、闸门、出处链接的位置）在 [daily-journal 的 vault-conventions.md](../daily-journal/references/vault-conventions.md)：那是唯一权威，这里只放写 .md 时用得上的判据与指针。
+本节自足：写任务行只看上面五条，不必先去读别的 skill。真源是库内插件配置（`taskFormat: tasksPluginEmoji`、`setCreatedDate: true`），本节与 [daily-journal 的 vault-conventions.md](../daily-journal/references/vault-conventions.md) 都是它的翻译，按用途分工——写 .md 看本节，跑 daily-journal 的 CLI（状态词表、`jt` 写入闸门、出处链接位置）看它那份。
 
 ## mermaid 图
 
