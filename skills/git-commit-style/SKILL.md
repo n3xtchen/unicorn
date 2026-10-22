@@ -46,7 +46,24 @@ Read [the decision log](references/decision-log.md) when changing this skill or 
 11. **提交前先对齐代码与文档。** 本次变更动了代码行为（接口、退出码、失败信息、默认值、校验口径等）时，提交前核对该模块文档是否仍与代码一致：skill 的 `SKILL.md` 条款与失败表、`references/decision-log.md` 的决策与验收项、`--help` 文本、README/CHANGELOG 等。确认属于本次变更的文档要对齐后与代码放进**同一个 Commit**，标题概括共同目标、正文说明同步了哪些文档；只有变更本身是纯文档工作，才单独提 `docs(...)`。
 12. **归属判不清就先问，不要强行对齐。** 判断某份文档是否由本次变更负责，需要三条都成立：同一目录或模块；文档里明确提到被改的符号、条款或行为；git 历史中曾与该代码一起提交。三条不齐就当作不确定：不改那份文档，把缺口单列出来向用户确认，宁可留着缺口也不动职责范围不清的文档。
 13. 需要执行 `git commit` 或 `git commit --amend` 时，提交标题与正文必须使用真实换行。优先使用带单引号分隔符的 quoted heredoc（例如 `git commit -F- <<'EOF'`），不要在普通字符串中使用 `\n` 拼接正文；否则 `\n` 会被原样写入 Commit message，`git log` 里显示成字面量 `\n`（一个反斜杠加 `n`），而不是真换行。
-14. 提交或 amend 后，必须用 `git log -1 --format='%B'` 检查正文排版，并搜索是否存在字面量 `\n`，例如 `git log -1 --format='%B' | grep -F '\n'`；必要时用 `git cat-file -p HEAD` 或十六进制检查确认实际换行。
+    排版固定为「标题 / 一个空行 / 正文项目符号」三段，标题必须单独成段：缺这个空行时 git 把整段当 subject，`git log --oneline`、MR 标题、changelog 会把正文折成长长一行。正文每条用 `-` 加一个空格开头，长行硬换行、续行缩进两个空格；message 末尾不留空行（git 自己补行尾换行）。安全的两种写法：两条 `-m`（git 自动在两者之间插空行），或 heredoc 里显式打出那一行空行。
+14. 提交或 amend 后必须跑下面四条自检，任何一条不过就 `--amend` 重来：
+
+    ```bash
+    # ① 第一段（到首个空行）只能有 1 行，否则标题已被正文吞掉
+    git log -1 --format=%B | awk 'BEGIN{n=0} /^$/{exit} {n++} END{exit !(n==1)}' \
+      || echo 'FATAL：标题与正文之间缺空行'
+    # ② 不许有字面量 \n
+    git log -1 --format=%B | grep -F '\n' && echo 'FATAL：字面量 \n'
+    # ③ --oneline 只能是一行标题，出现折叠就说明 ① 没过
+    git log --oneline -1
+    # ④ %B 前几行贴给用户，标题、空行、正文顺序可见
+    git log -1 --format=%B | head -5
+    ```
+
+    ② 会对正文里出现的字面量报错：需要提到这两个字符时用文字描述（反斜杠加 n），
+    不要直接写出来，否则自检命中自己的文案。
+
 15. **执行 `git commit` 或 `git commit --amend` 前默认先向用户确认。** 默认只生成或修改提交信息，不自动提交；即使用户已要求提交，也要先摆出两件事再等授权：
     - 将要提交的内容：`git status --short` 与 `git diff --cached --stat`，必要时附关键 diff；
     - 将要使用的完整 Commit 信息：标题和正文按原样给出，不要只给摘要。
