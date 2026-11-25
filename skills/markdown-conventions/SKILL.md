@@ -40,8 +40,8 @@ Read [decision-log.md](references/decision-log.md) before changing this skill or
 写完或改完 .md 立刻跑一遍，**报告 0 error 才算完成**：
 
 ```bash
-~/Dev/project_pig/unicorn/skills/markdown-conventions/scripts/mdlint.sh <file.md> [more.md ...]
-~/Dev/project_pig/unicorn/skills/markdown-conventions/scripts/mdlint.sh --fix <file.md>   # 先试自动修
+~/.agents/skills/markdown-conventions/scripts/mdlint.sh <file.md> [more.md ...]
+~/.agents/skills/markdown-conventions/scripts/mdlint.sh --fix <file.md>   # 先试自动修
 ```
 
 改动表格单元格之后尤其必须重跑：MD060 几乎都是"在已对齐的表格里手改了一个格子"造成的。
