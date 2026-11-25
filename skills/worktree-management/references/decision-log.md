@@ -118,11 +118,19 @@ skill 不默认使用：
 
 用户可以在同一次回复中对明确列出的 worktree 和 local branch 一并授权；不能用“清理相关内容”或“删除 worktree”推断 branch 删除授权。关系不确定或存在未合并提交的 branch 默认保留。
 
+## 2026-11-25：合并前增检 tag 锚点与场景化策略选型
+
+事实：在 monorepo + 多 worktree 场景下，仓库内并非全仓固定单一合并策略——带子模块 release tag 的分支必须保留原 SHA，而无 tag 的零散小需求分支往往更适合 `squash`。此前本 skill 仅声明“不要自行选择 squash/rebase”，缺少 `git tag --merged SOURCE --no-merged TARGET` 预检和按场景推荐规则。
+
+影响：若仅靠人工记忆判断是否挂有 release tag，合并时容易误选 `squash` 或 `rebase`，导致已有 tag 脱离 `master` 主线；同时与 `git-delivery-governance` 的默认策略倾向缺乏统一口径。
+
+最终边界：合并前必须检查 `git tag --merged SOURCE --no-merged TARGET`。存在 tag 时仅允许 `--ff-only` 或 `--no-ff`，禁用 `squash`/`rebase`；无 tag 时按“干净无分叉推荐 `--ff-only`、需留合入节点或有分叉推荐 `--no-ff`、未共享且提交琐碎的个人分支可提议 `squash`”给出建议并由用户确认。
+
 ## 当前固定边界
 
 - 默认清理范围：当前分支 fork 出去的 worktree 及其关联 local branch 候选；
 - 新 worktree 创建：必须人工确认；
-- 合并前：必须检查下游 worktree；
+- 合并前：必须检查 `SOURCE` 上的待合入 tag（有 tag 禁用 `squash`/`rebase`）及下游 worktree；
 - 下游未合并：先报告建议，由用户决策；
 - 合并后：source worktree 清理必须人工确认；
 - 清理 worktree 时盘点关联 branch，但 local branch 删除必须人工确认；

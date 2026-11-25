@@ -155,16 +155,28 @@ Agent 请求创建新的 worktree：
 
 ### 1. 先冻结合并意图
 
+先检查 `SOURCE` 相对 `TARGET` 是否挂有未合入的 tag：
+
+```bash
+git tag --merged SOURCE --no-merged TARGET
+```
+
 确认并报告：
 
 ```text
 源分支：SOURCE @ <SHA>
 目标分支：TARGET @ <SHA>
-合并方式：<ff-only / --no-ff / 项目约定>
+待合入 tag：<none 或 tag 列表>
+合并方式：<ff-only / --no-ff / squash / 项目约定>
 合并后是否计划删除 SOURCE worktree：是/否/未决定
 ```
 
-未指定合并方式时，读取仓库约定；仍无法确定时先询问，不要自行选择 squash、rebase 或 force push。
+合并方式选择规则（未指定时按此给出建议并请用户确认，不得隐式选择 `squash`、`rebase` 或 force push）：
+
+- **存在待合入 tag（尤其是 release tag）**：仅允许 `--ff-only` 或 `--no-ff`，**禁止 `squash` 和 `rebase`**（避免改写 commit SHA 导致 tag 脱离 `TARGET` 主线）。
+- **无 tag、提交已整理干净且相对 `TARGET` 无分叉**：默认推荐 `--ff-only`；若需要保留整体合入节点（便于审计或整批 `revert`）或存在分叉，推荐 `--no-ff`。
+- **无 tag、未共享、未派生下游 worktree 且过程提交琐碎的个人分支**：可向用户提议 `squash`（合入后删除源分支）。
+- **多人共享或已派生下游 worktree 的上游分支**：禁止 `rebase` 或强推改写历史。
 
 ### 2. 识别 SOURCE 的下游 worktree
 
